@@ -275,3 +275,78 @@ class BlockAllocator:
             )
         logical_block, offset = divmod(position, self.block_size)
         return table.block_ids[logical_block], offset
+
+
+# --- Paged block storage ---------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PagedCacheSpec:
+    """Shape and placement of the physical block pool."""
+
+    num_layers: int
+    num_blocks: int
+    block_size: int
+    num_kv_heads: int
+    head_dim: int
+    dtype: torch.dtype
+    device: torch.device
+
+    def __post_init__(self) -> None:
+        for name in ("num_layers", "num_blocks", "block_size", "num_kv_heads", "head_dim"):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} must be at least 1, got {getattr(self, name)}")
+
+    @property
+    def num_slots(self) -> int:
+        return self.num_blocks * self.block_size
+
+
+class PagedKVCache:
+    """The physical block pool: per layer, one K tensor and one V tensor of blocks.
+
+    Each is (num_blocks, block_size, num_kv_heads, head_dim). Block ids index the
+    first axis, so blocks belonging to one sequence need not be adjacent -- that
+    is the whole point, and it is what `BlockAllocator` hands out.
+
+    `flat_keys` reshapes to (num_blocks * block_size, num_kv_heads, head_dim) so a
+    token can be addressed by a single slot index, block_id * block_size + offset.
+    The reshape is a view of contiguous storage, so it costs nothing, and it turns
+    both the scatter of new KV and the gather of a sequence into one indexing op
+    each rather than a Python loop over blocks.
+    """
+
+    def __init__(self, spec: PagedCacheSpec) -> None:
+        self.spec = spec
+        shape = (spec.num_blocks, spec.block_size, spec.num_kv_heads, spec.head_dim)
+        self._keys = [
+            torch.zeros(shape, dtype=spec.dtype, device=spec.device)
+            for _ in range(spec.num_layers)
+        ]
+        self._values = [
+            torch.zeros(shape, dtype=spec.dtype, device=spec.device)
+            for _ in range(spec.num_layers)
+        ]
+        flat = (spec.num_slots, spec.num_kv_heads, spec.head_dim)
+        # Views onto the same storage. The backing tensors are never reallocated,
+        # so these stay valid for the life of the cache.
+        self._flat_keys = [tensor.view(flat) for tensor in self._keys]
+        self._flat_values = [tensor.view(flat) for tensor in self._values]
+
+    def flat_keys(self, layer_idx: int) -> torch.Tensor:
+        """Slot-addressed view of this layer's keys. Indexed by block*size+offset."""
+        return self._flat_keys[layer_idx]
+
+    def flat_values(self, layer_idx: int) -> torch.Tensor:
+        return self._flat_values[layer_idx]
+
+    def block_keys(self, layer_idx: int, block_id: int) -> torch.Tensor:
+        """One physical block's keys, (block_size, num_kv_heads, head_dim)."""
+        return self._keys[layer_idx][block_id]
+
+    def block_values(self, layer_idx: int, block_id: int) -> torch.Tensor:
+        return self._values[layer_idx][block_id]
+
+    def storage_bytes(self) -> int:
+        per_tensor = self._keys[0].numel() * self._keys[0].element_size()
+        return 2 * self.spec.num_layers * per_tensor

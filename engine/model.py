@@ -17,7 +17,15 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from engine.cache import CacheSpec, ContiguousKVCache
+from engine.attention import AttentionBackend, ContiguousBackend, PagedBackend
+from engine.cache import (
+    BLOCK_SIZE,
+    BlockAllocator,
+    CacheSpec,
+    ContiguousKVCache,
+    PagedCacheSpec,
+    PagedKVCache,
+)
 
 
 @dataclass(frozen=True)
@@ -141,15 +149,6 @@ def apply_rope(
     return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
 
 
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """Expand KV heads to query heads for GQA. Equivalent to repeat_interleave on dim 1."""
-    if n_rep == 1:
-        return x
-    batch, num_kv_heads, seq_len, head_dim = x.shape
-    expanded = x[:, :, None, :, :].expand(batch, num_kv_heads, n_rep, seq_len, head_dim)
-    return expanded.reshape(batch, num_kv_heads * n_rep, seq_len, head_dim)
-
-
 class Qwen2Engine:
     """Single-sequence greedy decoding over a KV cache this engine allocates."""
 
@@ -210,7 +209,7 @@ class Qwen2Engine:
         return cls(weights, dims, embed.device, embed.dtype)
 
     def new_cache(self, max_seq_len: int) -> ContiguousKVCache:
-        """Allocate a cache sized for one sequence of at most `max_seq_len`."""
+        """Allocate a contiguous cache sized for one sequence of at most `max_seq_len`."""
         return ContiguousKVCache(
             CacheSpec(
                 num_layers=self.dims.num_layers,
@@ -222,6 +221,41 @@ class Qwen2Engine:
             )
         )
 
+    def new_contiguous_backend(self, max_seq_len: int) -> ContiguousBackend:
+        """Step 1's storage, still the reference the paged path is checked against."""
+        return ContiguousBackend(
+            self.new_cache(max_seq_len), self.dims.num_kv_groups, self.dims.attn_scale
+        )
+
+    def new_paged_cache(
+        self, num_blocks: int, block_size: int = BLOCK_SIZE
+    ) -> PagedKVCache:
+        """Allocate a physical block pool matching this model's KV geometry."""
+        return PagedKVCache(
+            PagedCacheSpec(
+                num_layers=self.dims.num_layers,
+                num_blocks=num_blocks,
+                block_size=block_size,
+                num_kv_heads=self.dims.num_kv_heads,
+                head_dim=self.dims.head_dim,
+                dtype=self.dtype,
+                device=self.device,
+            )
+        )
+
+    def new_paged_backend(
+        self, cache: PagedKVCache, allocator: BlockAllocator, seq_id: int
+    ) -> PagedBackend:
+        """Register `seq_id` with the allocator and return a backend over it.
+
+        The caller owns the pool and the allocator, so a test can fragment the
+        pool before the sequence is ever registered.
+        """
+        allocator.create_sequence(seq_id)
+        return PagedBackend(
+            cache, allocator, seq_id, self.dims.num_kv_groups, self.dims.attn_scale
+        )
+
     # --- forward -----------------------------------------------------------
 
     def _attention(
@@ -230,10 +264,15 @@ class Qwen2Engine:
         hidden: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        cache: ContiguousKVCache,
+        backend: AttentionBackend,
         layer_idx: int,
-        start: int,
     ) -> torch.Tensor:
+        """Project and rotate Q/K/V, then let the backend decide where KV lives.
+
+        Everything below the rotary embedding is storage-agnostic: the backend
+        stores this layer's K/V and attends over the whole sequence. Contiguous
+        and paged differ only inside `attend`.
+        """
         dims = self.dims
         n = hidden.shape[1]
 
@@ -247,31 +286,7 @@ class Qwen2Engine:
 
         q, k = apply_rope(q, k, cos, sin)
 
-        cache.write(layer_idx, start, k, v)
-        total = start + n
-        keys = repeat_kv(cache.keys(layer_idx, total), dims.num_kv_groups)
-        values = repeat_kv(cache.values(layer_idx, total), dims.num_kv_groups)
-
-        # A multi-token query is only ever a prefill from an empty cache here,
-        # where q_len == kv_len and SDPA's top-left causal alignment is correct.
-        # Guarded rather than assumed, because a partial prefill into a warm
-        # cache would silently attend to the wrong positions.
-        is_causal = n > 1
-        if is_causal and start != 0:
-            raise NotImplementedError(
-                f"multi-token forward at cache offset {start}: is_causal alignment "
-                "only holds for a prefill from an empty cache"
-            )
-
-        attn = F.scaled_dot_product_attention(
-            q,
-            keys,
-            values,
-            attn_mask=None,
-            dropout_p=0.0,
-            scale=dims.attn_scale,
-            is_causal=is_causal,
-        )
+        attn = backend.attend(layer_idx, q, k, v)
         attn = attn.transpose(1, 2).reshape(1, n, dims.num_heads * dims.head_dim)
         return F.linear(attn, layer.o_proj_weight)
 
@@ -282,12 +297,13 @@ class Qwen2Engine:
 
     @torch.inference_mode()
     def forward(
-        self, token_ids: torch.Tensor, positions: torch.Tensor, cache: ContiguousKVCache
+        self, token_ids: torch.Tensor, positions: torch.Tensor, backend: AttentionBackend
     ) -> torch.Tensor:
         """Run one forward pass and return logits for the final query position.
 
-        `token_ids` and `positions` are 1-D and the same length. The cache is
-        advanced by that length once every layer has written its slots.
+        `token_ids` and `positions` are 1-D and the same length. The backend
+        reserves room first so every layer writes at the same offset, and the
+        sequence length only moves once all of them have.
         """
         if token_ids.ndim != 1 or positions.ndim != 1:
             raise ValueError("token_ids and positions must be 1-D")
@@ -297,16 +313,22 @@ class Qwen2Engine:
             )
 
         n = token_ids.shape[0]
-        start = cache.length
+        reservation = backend.begin_forward(n)
+        if not reservation.ok:
+            # The allocator reports exhaustion as a value, which is what lets a
+            # scheduler preempt instead of unwinding. There is no scheduler yet,
+            # so at this layer it becomes an error rather than being swallowed.
+            raise RuntimeError(
+                f"cache exhausted reserving {n} token(s): {reservation.status.value}"
+            )
+
         hidden = self.weights.embed_tokens[token_ids].unsqueeze(0)
         cos, sin = build_cos_sin(self.inv_freq, positions.unsqueeze(0), hidden.dtype)
 
         for layer_idx, layer in enumerate(self.weights.layers):
             residual = hidden
             hidden = rms_norm(hidden, layer.input_layernorm_weight, self.dims.rms_norm_eps)
-            hidden = residual + self._attention(
-                layer, hidden, cos, sin, cache, layer_idx, start
-            )
+            hidden = residual + self._attention(layer, hidden, cos, sin, backend, layer_idx)
 
             residual = hidden
             hidden = rms_norm(
@@ -314,7 +336,7 @@ class Qwen2Engine:
             )
             hidden = residual + self._mlp(layer, hidden)
 
-        cache.advance(n)
+        backend.end_forward(n)
 
         hidden = rms_norm(hidden, self.weights.final_norm_weight, self.dims.rms_norm_eps)
         return F.linear(hidden[0, -1], self.weights.lm_head_weight)
@@ -323,12 +345,18 @@ class Qwen2Engine:
 
     @torch.inference_mode()
     def generate_greedy(
-        self, prompt_token_ids: list[int], max_new_tokens: int
+        self,
+        prompt_token_ids: list[int],
+        max_new_tokens: int,
+        backend: AttentionBackend | None = None,
     ) -> GenerationResult:
         """Greedy decode. EOS is ignored: exactly `max_new_tokens` are produced.
 
         Ignoring EOS is the workload contract from bench/workload.py, and it
         keeps this comparable against a baseline doing the same amount of work.
+
+        `backend` selects where KV lives. Default is the contiguous cache; pass a
+        `PagedBackend` to run the same decode over scattered physical blocks.
         """
         if max_new_tokens < 1:
             raise ValueError(f"max_new_tokens must be at least 1, got {max_new_tokens}")
@@ -336,11 +364,12 @@ class Qwen2Engine:
             raise ValueError("prompt must be non-empty")
 
         prompt_len = len(prompt_token_ids)
-        cache = self.new_cache(prompt_len + max_new_tokens)
+        if backend is None:
+            backend = self.new_contiguous_backend(prompt_len + max_new_tokens)
 
         prompt = torch.tensor(prompt_token_ids, dtype=torch.long, device=self.device)
         positions = torch.arange(prompt_len, dtype=torch.long, device=self.device)
-        logits = self.forward(prompt, positions, cache)
+        logits = self.forward(prompt, positions, backend)
 
         generated: list[int] = []
         step_logits: list[torch.Tensor] = []
@@ -354,7 +383,7 @@ class Qwen2Engine:
             next_pos = torch.tensor(
                 [prompt_len + step], dtype=torch.long, device=self.device
             )
-            logits = self.forward(next_ids, next_pos, cache)
+            logits = self.forward(next_ids, next_pos, backend)
 
         return GenerationResult(
             token_ids=tuple(generated), step_logits=torch.stack(step_logits)
