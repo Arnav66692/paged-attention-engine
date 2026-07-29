@@ -1,0 +1,58 @@
+# Full transitive lock for the paged attention engine, Gate 1.
+#
+# Interpreter: Python 3.14.6 (main, Jun 10 2026, 10:03:53) [Clang 17.0.0 (clang-1700.6.4.2)]
+#
+# Generated 2026-07-29 by `pip freeze` over the repo-root .venv on macOS arm64.
+# requirements.txt pins only the six direct dependencies; this file pins all 39
+# installed distributions so a rebuild cannot drift on a transitive package.
+#
+# *** torch==2.12.1 below is the default PyPI macOS arm64 wheel: torch.version.cuda
+# *** is None, MPS built and available. It MUST be replaced on a CUDA host --
+# *** that platform needs a different build (a +cuXXX local version from the
+# *** PyTorch index), and installing this file unmodified there will either fail
+# *** or silently give you a CPU-only torch. Every other line is
+# *** platform-independent: same version, correct wheel per platform.
+#
+# Install: python3 -m pip install -r requirements.lock.txt
+#
+# Regenerate: .venv/bin/python -m pip freeze
+
+accelerate==1.14.0
+annotated-doc==0.0.5
+anyio==4.14.2
+certifi==2026.7.22
+click==8.4.2
+filelock==3.32.0
+fsspec==2026.7.0
+h11==0.16.0
+hf-xet==1.5.2
+httpcore==1.0.9
+httpx==0.28.1
+huggingface_hub==1.25.1
+idna==3.18
+iniconfig==2.3.0
+Jinja2==3.1.6
+markdown-it-py==4.2.0
+MarkupSafe==3.0.3
+mdurl==0.1.2
+mpmath==1.3.0
+networkx==3.6.1
+numpy==2.5.0
+packaging==26.2
+pluggy==1.6.0
+psutil==7.2.2
+Pygments==2.20.0
+pytest==9.1.1
+PyYAML==6.0.3
+regex==2026.7.19
+rich==15.0.0
+safetensors==0.8.0
+setuptools==81.0.0
+shellingham==1.5.4
+sympy==1.14.0
+tokenizers==0.22.2
+torch==2.12.1
+tqdm==4.70.0
+transformers==5.12.1
+typer==0.27.0
+typing_extensions==4.16.0
