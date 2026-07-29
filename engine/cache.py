@@ -1,14 +1,38 @@
-"""KV cache storage.
+"""KV cache storage: the contiguous single-sequence cache, and the block allocator.
 
-Gate 1, Step 1: one contiguous K tensor and one contiguous V tensor per layer,
-allocated up front for a single sequence. Nothing here is a HuggingFace cache
-object and nothing here subclasses one -- replacing that is the point of this
-step. The block allocator that supersedes this arrives at Step 2.
+Step 1 built `ContiguousKVCache` -- one contiguous K tensor and one contiguous V
+tensor per layer, allocated up front for a single sequence. Nothing here is a
+HuggingFace cache object and nothing here subclasses one; replacing that was the
+point of that step.
+
+Step 2 adds `BlockAllocator` beside it, not in place of it. The contiguous cache
+stays as the reference implementation Step 3's paged attention is checked
+against, so both must keep working.
+
+The two differ in exactly one respect. The contiguous cache maps logical
+position p to physical slot p. The allocator breaks that identity: a sequence
+holds a block table mapping logical block index to a physical block id drawn
+from a shared free list, so consecutive positions need not be adjacent in
+memory. Everything else about the storage is unchanged.
 """
 
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
+from enum import Enum
 
 import torch
+
+# --- LOCKED (Gate 1 spec) --------------------------------------------------
+# These are the engine's own copies. bench/workload.py restates them because it
+# predates engine/, and it is frozen; tests/test_alloc.py asserts the two agree
+# so they cannot drift.
+BLOCK_SIZE = 16
+NUM_GPU_BLOCKS = 3584
+
+# Locked, and not yet used: admission is a later step, and there is no scheduler
+# at Step 2. Recorded here so the value lives with the rest of the cache config
+# rather than being introduced from nowhere when admission lands.
+ADMISSION_MARGIN_BLOCKS = 1
 
 
 @dataclass(frozen=True)
@@ -100,3 +124,154 @@ class ContiguousKVCache:
         """Total bytes held across all layers, K and V."""
         per_tensor = self._keys[0].numel() * self._keys[0].element_size()
         return 2 * self.spec.num_layers * per_tensor
+
+
+# --- Block allocator -------------------------------------------------------
+
+
+class AllocStatus(Enum):
+    """Outcome of an allocation request.
+
+    Capacity exhaustion is a value, not an exception: the scheduler will ask for
+    blocks on every decode step and a full pool is an ordinary, expected answer
+    that it handles by preempting. Exceptions here are reserved for caller bugs
+    -- an unknown sequence id, a double free -- which are not recoverable and
+    should not be caught.
+    """
+
+    OK = "ok"
+    OUT_OF_BLOCKS = "out_of_blocks"
+
+
+@dataclass(frozen=True)
+class AllocResult:
+    """What an allocation did. `new_block_ids` is empty when nothing was needed."""
+
+    status: AllocStatus
+    new_block_ids: tuple[int, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return self.status is AllocStatus.OK
+
+
+@dataclass
+class BlockTable:
+    """One sequence's logical-block-index to physical-block-id mapping.
+
+    Mutated only by the `BlockAllocator` that issued it. Read it through the
+    allocator's accessors, which hand back copies.
+    """
+
+    block_ids: list[int] = field(default_factory=list)
+    num_tokens: int = 0
+
+    def __len__(self) -> int:
+        return len(self.block_ids)
+
+
+class BlockAllocator:
+    """A free list of physical blocks and the per-sequence tables that hold them.
+
+    Every physical block is in exactly one of two places at all times: the free
+    list, or exactly one sequence's block table. That is the invariant the whole
+    design rests on, and `tests/test_alloc.py` checks it after every operation.
+
+    Freed blocks go to the back of the free list rather than the front. Reuse is
+    therefore as delayed as possible, which makes a use-after-free show up as
+    corrupted data in a test instead of being masked by handing the same block
+    straight back out.
+    """
+
+    def __init__(self, num_blocks: int = NUM_GPU_BLOCKS, block_size: int = BLOCK_SIZE) -> None:
+        if num_blocks < 1:
+            raise ValueError(f"num_blocks must be at least 1, got {num_blocks}")
+        if block_size < 1:
+            raise ValueError(f"block_size must be at least 1, got {block_size}")
+        self.num_blocks = num_blocks
+        self.block_size = block_size
+        self._free: deque[int] = deque(range(num_blocks))
+        self._tables: dict[int, BlockTable] = {}
+
+    # --- pool state --------------------------------------------------------
+
+    @property
+    def num_free(self) -> int:
+        return len(self._free)
+
+    @property
+    def num_allocated(self) -> int:
+        return sum(len(table) for table in self._tables.values())
+
+    def free_block_ids(self) -> tuple[int, ...]:
+        """Copy of the free list, in the order blocks would be handed out."""
+        return tuple(self._free)
+
+    def sequence_ids(self) -> tuple[int, ...]:
+        return tuple(self._tables)
+
+    def blocks_needed(self, num_tokens: int) -> int:
+        """Blocks required to hold `num_tokens`, i.e. ceil division."""
+        if num_tokens < 0:
+            raise ValueError(f"num_tokens must be non-negative, got {num_tokens}")
+        return -(-num_tokens // self.block_size)
+
+    # --- per-sequence lifecycle -------------------------------------------
+
+    def create_sequence(self, seq_id: int) -> None:
+        """Register an empty sequence. Holds no blocks until tokens are appended."""
+        if seq_id in self._tables:
+            raise KeyError(f"sequence {seq_id} already exists")
+        self._tables[seq_id] = BlockTable()
+
+    def block_table(self, seq_id: int) -> tuple[int, ...]:
+        """Copy of the sequence's logical-to-physical mapping."""
+        return tuple(self._tables[seq_id].block_ids)
+
+    def num_tokens(self, seq_id: int) -> int:
+        return self._tables[seq_id].num_tokens
+
+    def append_token(self, seq_id: int) -> AllocResult:
+        """Append one token, taking a block only if the last one just filled."""
+        return self.append_tokens(seq_id, 1)
+
+    def append_tokens(self, seq_id: int, count: int) -> AllocResult:
+        """Append `count` tokens, taking whatever blocks that needs.
+
+        All or nothing. If the free list cannot cover the whole request this
+        returns OUT_OF_BLOCKS having touched nothing -- no partial allocation,
+        no tokens recorded -- so a caller that retries later sees the pool
+        exactly as it left it.
+        """
+        if count < 0:
+            raise ValueError(f"count must be non-negative, got {count}")
+        table = self._tables[seq_id]
+
+        required = self.blocks_needed(table.num_tokens + count) - len(table)
+        if required > len(self._free):
+            return AllocResult(AllocStatus.OUT_OF_BLOCKS)
+
+        taken = tuple(self._free.popleft() for _ in range(required))
+        table.block_ids.extend(taken)
+        table.num_tokens += count
+        return AllocResult(AllocStatus.OK, new_block_ids=taken)
+
+    def free_sequence(self, seq_id: int) -> tuple[int, ...]:
+        """Drop the whole table and return every block it held, in table order."""
+        table = self._tables.pop(seq_id)
+        freed = tuple(table.block_ids)
+        self._free.extend(freed)
+        return freed
+
+    # --- address translation ----------------------------------------------
+
+    def physical_slot(self, seq_id: int, position: int) -> tuple[int, int]:
+        """Map a logical token position to (physical block id, offset in block)."""
+        table = self._tables[seq_id]
+        if not 0 <= position < table.num_tokens:
+            raise IndexError(
+                f"position {position} out of range for sequence {seq_id} "
+                f"holding {table.num_tokens} tokens"
+            )
+        logical_block, offset = divmod(position, self.block_size)
+        return table.block_ids[logical_block], offset

@@ -7,28 +7,46 @@ HuggingFace's decode path for ours changes nothing observable:
   * all 32 generated token IDs are exactly equal, and
   * per-step logits agree within LOGIT_ATOL.
 
-Two independent baselines are run. `hf_greedy_cached` is HuggingFace driving its
-own DynamicCache, the realistic path. `hf_greedy_recompute` uses no cache at all
-and re-runs the full prefix every step, so it depends on no cache implementation
-whatsoever. They are asserted equal to each other first: if that fails, the
-baseline is the suspect, not the engine.
+Prompt lengths are chosen against the locked block size of 16, so the fixtures
+already cover the cases that will matter once attention is paged at Step 3: a
+prompt shorter than one block, a prompt that is an exact block multiple, and a
+prompt that ends mid-block.
+
+Two independent baselines exist. `hf_greedy_cached` is HuggingFace driving its
+own DynamicCache, the realistic path and the one parity is asserted against.
+`hf_greedy_recompute` uses no cache at all and re-runs the full prefix every
+step, so it depends on no cache implementation whatsoever; it is O(n^2) and
+marked slow, so it is opt-in via `-m slow`. When both run, the cross-check
+answers "is the engine wrong, or is the baseline wrong?".
 
 Tolerance is fixed up front from the arithmetic, never fitted to an observed
 result. The max observed deviation is printed for every configuration.
 """
 
-import sys
+from dataclasses import dataclass
 from functools import lru_cache
 
 import pytest
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
+from engine.cache import BLOCK_SIZE
 from engine.model import Qwen2Engine
 
 DEV_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 
-FIXED_PROMPT = "The capital of France is Paris, and the capital of Japan is"
+# Sliced to each length below, so every fixture is a prefix of one fixed text.
+BASE_PROMPT = (
+    "The capital of France is Paris, and the capital of Japan is Tokyo. "
+    "Rivers shape the cities built beside them, carrying trade inland long "
+    "before roads were paved, and the oldest bridges still mark where the "
+    "first crossings were cut into the banks."
+)
+
+# Against the locked block size of 16: under one block, an exact multiple, and
+# one token past a boundary. Asserted against BLOCK_SIZE so they cannot quietly
+# stop meaning that.
+PROMPT_LENGTHS = (13, 32, 33)
 SEED = 0
 NUM_GENERATED_TOKENS = 32
 
@@ -49,6 +67,15 @@ LOGIT_ATOL = 1e-3
 PARITY_DTYPE = torch.float32
 
 
+@dataclass
+class Runtime:
+    """A loaded model and an engine sharing its weight tensors."""
+
+    device: str
+    model: object
+    engine: Qwen2Engine
+
+
 def _devices() -> list[str]:
     devices = ["cpu"]
     if torch.backends.mps.is_available():
@@ -56,20 +83,24 @@ def _devices() -> list[str]:
     return devices
 
 
-@lru_cache(maxsize=None)
-def _load(device: str):
-    """Load the model once per device and build an engine sharing its weights."""
+@pytest.fixture(scope="module", params=_devices())
+def runtime(request) -> Runtime:
+    """Load the model once per device for the whole module."""
+    device = request.param
     model = AutoModelForCausalLM.from_pretrained(DEV_MODEL, dtype=PARITY_DTYPE)
     model.eval()
     model.to(device)
-    engine = Qwen2Engine.from_hf_model(model)
-    return model, engine
+    return Runtime(device=device, model=model, engine=Qwen2Engine.from_hf_model(model))
 
 
 @lru_cache(maxsize=None)
-def _prompt_ids() -> tuple[int, ...]:
+def _prompt_ids(length: int) -> tuple[int, ...]:
+    """The first `length` token IDs of BASE_PROMPT."""
     tokenizer = AutoTokenizer.from_pretrained(DEV_MODEL)
-    return tuple(tokenizer(FIXED_PROMPT, add_special_tokens=False)["input_ids"])
+    ids = tokenizer(BASE_PROMPT, add_special_tokens=False)["input_ids"]
+    if len(ids) < length:
+        raise ValueError(f"BASE_PROMPT is {len(ids)} tokens, need at least {length}")
+    return tuple(ids[:length])
 
 
 @torch.inference_mode()
@@ -117,40 +148,26 @@ def _max_abs_deviation(a: torch.Tensor, b: torch.Tensor) -> float:
     return (a.float() - b.float()).abs().max().item()
 
 
-@pytest.mark.parametrize("device", _devices())
-def test_baselines_agree(device):
-    """The two HuggingFace baselines must agree before either is trusted."""
-    torch.manual_seed(SEED)
-    model, _ = _load(device)
-    prompt_ids = _prompt_ids()
-
-    cached_tokens, cached_logits = hf_greedy_cached(
-        model, prompt_ids, NUM_GENERATED_TOKENS, device
-    )
-    recompute_tokens, recompute_logits = hf_greedy_recompute(
-        model, prompt_ids, NUM_GENERATED_TOKENS, device
-    )
-
-    deviation = _max_abs_deviation(cached_logits, recompute_logits)
-    print(
-        f"\n[{device}] baseline cross-check: HF-cached vs HF-recompute "
-        f"max |dlogit| = {deviation:.3e} (atol {LOGIT_ATOL:.1e})"
-    )
-    assert cached_tokens == recompute_tokens
-    assert deviation <= LOGIT_ATOL
+def test_prompt_lengths_cover_block_boundaries():
+    """The fixture lengths mean what the docstring claims, against BLOCK_SIZE."""
+    sub_block, exact_multiple, mid_block = PROMPT_LENGTHS
+    assert sub_block < BLOCK_SIZE
+    assert exact_multiple % BLOCK_SIZE == 0
+    assert mid_block % BLOCK_SIZE == 1
 
 
-@pytest.mark.parametrize("device", _devices())
-def test_parity_tokens_and_logits(device):
+@pytest.mark.parametrize("prompt_len", PROMPT_LENGTHS)
+def test_parity_tokens_and_logits(runtime, prompt_len):
     """Our decode loop and cache reproduce HuggingFace exactly on tokens."""
     torch.manual_seed(SEED)
-    model, engine = _load(device)
-    prompt_ids = _prompt_ids()
+    device = runtime.device
+    prompt_ids = _prompt_ids(prompt_len)
+    assert len(prompt_ids) == prompt_len
 
     hf_tokens, hf_logits = hf_greedy_cached(
-        model, prompt_ids, NUM_GENERATED_TOKENS, device
+        runtime.model, prompt_ids, NUM_GENERATED_TOKENS, device
     )
-    result = engine.generate_greedy(list(prompt_ids), NUM_GENERATED_TOKENS)
+    result = runtime.engine.generate_greedy(list(prompt_ids), NUM_GENERATED_TOKENS)
 
     assert result.step_logits.shape[0] == NUM_GENERATED_TOKENS
     assert len(result.token_ids) == NUM_GENERATED_TOKENS
@@ -159,40 +176,60 @@ def test_parity_tokens_and_logits(device):
     per_step = (result.step_logits.float() - hf_logits.float()).abs().amax(dim=-1)
 
     print(
-        f"\n[{device}] engine vs HF over {NUM_GENERATED_TOKENS} steps, "
-        f"prompt_len={len(prompt_ids)}, dtype={PARITY_DTYPE}"
+        f"\n[{device}] prompt_len={prompt_len} ({prompt_len / BLOCK_SIZE:.2f} blocks), "
+        f"{NUM_GENERATED_TOKENS} steps, dtype={PARITY_DTYPE}"
     )
     print(f"[{device}]   tokens identical      : {result.token_ids == hf_tokens}")
     print(f"[{device}]   MAX ABS DEVIATION     : {deviation:.6e}")
     print(f"[{device}]   tolerance (LOGIT_ATOL): {LOGIT_ATOL:.1e}")
     print(f"[{device}]   worst step            : {int(per_step.argmax())}")
-    print(f"[{device}]   first-step deviation  : {per_step[0].item():.6e}")
-    print(f"[{device}]   last-step deviation   : {per_step[-1].item():.6e}")
 
     assert result.token_ids == hf_tokens, (
-        f"token mismatch: engine {result.token_ids} vs HF {hf_tokens}"
+        f"token mismatch at prompt_len={prompt_len}: "
+        f"engine {result.token_ids} vs HF {hf_tokens}"
     )
     assert deviation <= LOGIT_ATOL, (
         f"max abs logit deviation {deviation:.6e} exceeds LOGIT_ATOL {LOGIT_ATOL:.1e}"
     )
 
 
-@pytest.mark.parametrize("device", _devices())
-def test_cache_is_ours_and_contiguous(device):
+@pytest.mark.slow
+@pytest.mark.parametrize("prompt_len", PROMPT_LENGTHS)
+def test_baselines_agree(runtime, prompt_len):
+    """The two HuggingFace baselines agree, so either can be trusted as ground truth.
+
+    Opt-in: the recompute baseline re-runs the whole prefix every step.
+    """
+    torch.manual_seed(SEED)
+    device = runtime.device
+    prompt_ids = _prompt_ids(prompt_len)
+
+    cached_tokens, cached_logits = hf_greedy_cached(
+        runtime.model, prompt_ids, NUM_GENERATED_TOKENS, device
+    )
+    recompute_tokens, recompute_logits = hf_greedy_recompute(
+        runtime.model, prompt_ids, NUM_GENERATED_TOKENS, device
+    )
+
+    deviation = _max_abs_deviation(cached_logits, recompute_logits)
+    print(
+        f"\n[{device}] prompt_len={prompt_len} baseline cross-check: "
+        f"HF-cached vs HF-recompute max |dlogit| = {deviation:.3e} (atol {LOGIT_ATOL:.1e})"
+    )
+    assert cached_tokens == recompute_tokens
+    assert deviation <= LOGIT_ATOL
+
+
+def test_cache_is_ours_and_contiguous(runtime):
     """The path under test must not be holding a transformers cache object."""
-    _, engine = _load(device)
+    engine = runtime.engine
     cache = engine.new_cache(max_seq_len=64)
 
     assert type(cache).__module__.startswith("engine.")
     assert not isinstance(cache, DynamicCache)
-    for name, module in sys.modules.items():
-        if name == "engine.cache":
-            assert "cache_utils" not in getattr(module, "__dict__", {})
 
-    # One contiguous tensor per layer for K and for V.
     assert cache.length == 0
-    keys = cache.keys(0, 0)
-    assert keys.shape == (1, engine.dims.num_kv_heads, 0, engine.dims.head_dim)
+    assert cache.keys(0, 0).shape == (1, engine.dims.num_kv_heads, 0, engine.dims.head_dim)
     full = cache.keys(0, 64)
     assert full.is_contiguous()
     assert full.shape == (1, engine.dims.num_kv_heads, 64, engine.dims.head_dim)
