@@ -1,4 +1,4 @@
-"""Step 4: continuous batching scheduler.
+"""Step 4: continuous batching scheduler, and Step 5b's second execution mode.
 
 The gate is equality: running N requests concurrently must produce byte-identical
 tokens to running each one alone. Two tiers of test assert it.
@@ -15,6 +15,18 @@ The model tier runs the same comparison through Qwen2.5-0.5B on both devices.
 
 `test_oversized_request_cannot_wedge_the_queue` is the admission guard's reason
 for existing: without it that request livelocks the scheduler at zero throughput.
+
+EXECUTION MODES. Step 5b added `ExecutionMode.FUSED`, which runs a step in one
+batched forward instead of one forward per sequence. Because the stub's
+arithmetic is exact, every stub-tier test here is parametrized over both modes:
+the scheduler's decisions must not depend on how the forwards are issued, and
+byte-identity must survive fusion where the arithmetic itself is exact.
+
+The model-tier byte-identity tests are pinned to UNFUSED on purpose. Fusion pads
+the batch and changes every reduction's shape, so on real floating point it
+agrees with the reference to a declared tolerance rather than exactly. That
+comparison lives in `tests/test_fused.py`, where the tolerance is declared. This
+file keeps the exact claim against the exact path.
 """
 
 import time
@@ -33,6 +45,7 @@ from engine.cache import (
 )
 from engine.scheduler import (
     EventKind,
+    ExecutionMode,
     Qwen2Executor,
     Request,
     Scheduler,
@@ -42,6 +55,8 @@ from engine.scheduler import (
 STUB_VOCAB = 64
 SEED = 0
 
+MODES = (ExecutionMode.UNFUSED, ExecutionMode.FUSED)
+
 
 class StubExecutor:
     """Real block accounting, deterministic sequence-local logits.
@@ -49,6 +64,12 @@ class StubExecutor:
     The next token depends only on this sequence's own last token and position,
     never on what else is running. Concurrency-independence is therefore a
     property of the stub, so the equality tests below isolate the scheduler.
+
+    `forward_batch` is a Python loop here, and that is fine: this tier exists to
+    test the *scheduler*, and what it proves about fusion is only that a step
+    issues one call. Whether that call is really one forward pass is a claim about
+    the model, and `tests/test_fused.py` counts the engine's own passes to settle
+    it.
     """
 
     def __init__(self, allocator: BlockAllocator) -> None:
@@ -65,35 +86,57 @@ class StubExecutor:
             )
         )
         self.forward_calls = 0
+        self.batch_calls = 0
 
     def new_backend(self, seq_id: int) -> PagedBackend:
         self.allocator.create_sequence(seq_id)
         return PagedBackend(self.cache, self.allocator, seq_id, num_kv_groups=1, scale=1.0)
 
-    def forward(self, token_ids, positions, backend) -> torch.Tensor:
-        self.forward_calls += 1
-        reservation = backend.begin_forward(len(token_ids))
+    def reserve(self, backend, num_tokens):
+        reservation = backend.begin_forward(num_tokens)
         if not reservation.ok:
             raise RuntimeError(
-                f"stub forward could not reserve {len(token_ids)} tokens: "
+                f"stub could not reserve {num_tokens} tokens: "
                 f"{reservation.status.value}; the scheduler should have checked first"
             )
-        backend.end_forward(len(token_ids))
+        return reservation
 
+    def _logits(self, token_ids, positions) -> torch.Tensor:
         next_token = (token_ids[-1] * 7 + positions[-1] * 13 + 1) % STUB_VOCAB
         logits = torch.full((STUB_VOCAB,), -1.0)
         logits[next_token] = 1.0
         return logits
+
+    def forward(self, token_ids, positions, backend) -> torch.Tensor:
+        self.forward_calls += 1
+        backend.end_forward(len(token_ids))
+        return self._logits(token_ids, positions)
+
+    def forward_batch(self, inputs) -> torch.Tensor:
+        self.batch_calls += 1
+        rows = []
+        for item in inputs:
+            item.backend.end_forward(len(item.token_ids))
+            rows.append(self._logits(item.token_ids, item.positions))
+        return torch.stack(rows)
+
+    @property
+    def calls(self) -> int:
+        return self.forward_calls + self.batch_calls
 
 
 def _stub_scheduler(
     num_blocks: int,
     margin: int = ADMISSION_MARGIN_BLOCKS,
     block_size: int = BLOCK_SIZE,
+    mode: ExecutionMode = ExecutionMode.UNFUSED,
 ):
     allocator = BlockAllocator(num_blocks=num_blocks, block_size=block_size)
     executor = StubExecutor(allocator)
-    return Scheduler(executor, allocator, admission_margin_blocks=margin), allocator
+    return (
+        Scheduler(executor, allocator, admission_margin_blocks=margin, mode=mode),
+        allocator,
+    )
 
 
 def _request(request_id: str, prompt_len: int, max_new_tokens: int) -> Request:
@@ -106,18 +149,28 @@ def _request(request_id: str, prompt_len: int, max_new_tokens: int) -> Request:
     )
 
 
-def _run_sequentially(requests, num_blocks: int, margin: int = ADMISSION_MARGIN_BLOCKS):
+def _run_sequentially(
+    requests,
+    num_blocks: int,
+    margin: int = ADMISSION_MARGIN_BLOCKS,
+    mode: ExecutionMode = ExecutionMode.UNFUSED,
+):
     """Each request alone, on a fresh scheduler and a fresh pool."""
     outputs = {}
     for request in requests:
-        scheduler, _ = _stub_scheduler(num_blocks, margin)
+        scheduler, _ = _stub_scheduler(num_blocks, margin, mode=mode)
         assert scheduler.add_request(request)
         outputs.update(scheduler.run_to_completion())
     return outputs
 
 
-def _run_concurrently(requests, num_blocks: int, margin: int = ADMISSION_MARGIN_BLOCKS):
-    scheduler, _ = _stub_scheduler(num_blocks, margin)
+def _run_concurrently(
+    requests,
+    num_blocks: int,
+    margin: int = ADMISSION_MARGIN_BLOCKS,
+    mode: ExecutionMode = ExecutionMode.UNFUSED,
+):
+    scheduler, _ = _stub_scheduler(num_blocks, margin, mode=mode)
     for request in requests:
         assert scheduler.add_request(request)
     return scheduler.run_to_completion(), scheduler
@@ -144,41 +197,52 @@ AMPLE_POOL_BLOCKS = 64
 # --- the gate ---------------------------------------------------------------
 
 
-def test_concurrent_matches_sequential():
-    """Byte-identical, not close: the whole point of iteration-level scheduling."""
-    sequential = _run_sequentially(MIXED_REQUESTS, num_blocks=AMPLE_POOL_BLOCKS)
-    concurrent, scheduler = _run_concurrently(MIXED_REQUESTS, num_blocks=AMPLE_POOL_BLOCKS)
+@pytest.mark.parametrize("mode", MODES)
+def test_concurrent_matches_sequential(mode):
+    """Byte-identical, not close: the whole point of iteration-level scheduling.
+
+    Asserted in both execution modes. The stub's arithmetic does not depend on
+    batch shape, so fusion must not disturb this even though on the real model it
+    only holds to a tolerance -- any difference here would be the scheduler.
+    """
+    sequential = _run_sequentially(MIXED_REQUESTS, num_blocks=AMPLE_POOL_BLOCKS, mode=mode)
+    concurrent, scheduler = _run_concurrently(
+        MIXED_REQUESTS, num_blocks=AMPLE_POOL_BLOCKS, mode=mode
+    )
 
     assert set(concurrent) == set(sequential)
     for request_id in sorted(sequential):
         assert concurrent[request_id] == sequential[request_id], (
-            f"{request_id} diverged: concurrent {concurrent[request_id]} "
+            f"[{mode.value}] {request_id} diverged: concurrent {concurrent[request_id]} "
             f"vs sequential {sequential[request_id]}"
         )
     print(
-        f"\nconcurrent == sequential over {len(MIXED_REQUESTS)} requests, "
+        f"\n[{mode.value}] concurrent == sequential over {len(MIXED_REQUESTS)} requests, "
         f"{sum(len(v) for v in concurrent.values())} tokens total"
     )
     assert not scheduler.events_of(EventKind.PREEMPT), "pool was meant to be ample here"
 
 
-def test_concurrent_matches_sequential_under_forced_preemption():
+@pytest.mark.parametrize("mode", MODES)
+def test_concurrent_matches_sequential_under_forced_preemption(mode):
     """Same equality when the pool is too small and sequences get recomputed."""
-    sequential = _run_sequentially(GROWTH_REQUESTS, num_blocks=AMPLE_POOL_BLOCKS)
-    concurrent, scheduler = _run_concurrently(GROWTH_REQUESTS, num_blocks=GROWTH_POOL_BLOCKS)
+    sequential = _run_sequentially(GROWTH_REQUESTS, num_blocks=AMPLE_POOL_BLOCKS, mode=mode)
+    concurrent, scheduler = _run_concurrently(
+        GROWTH_REQUESTS, num_blocks=GROWTH_POOL_BLOCKS, mode=mode
+    )
 
     preemptions = scheduler.events_of(EventKind.PREEMPT)
     recomputes = scheduler.events_of(EventKind.RECOMPUTE)
     print(
-        f"\nforced preemption: {len(preemptions)} preempts, {len(recomputes)} recomputes "
-        f"on a {GROWTH_POOL_BLOCKS}-block pool"
+        f"\n[{mode.value}] forced preemption: {len(preemptions)} preempts, "
+        f"{len(recomputes)} recomputes on a {GROWTH_POOL_BLOCKS}-block pool"
     )
     assert preemptions, "pool was not small enough to force preemption"
     assert recomputes, "preempted sequences were never recomputed"
 
     for request_id in sorted(sequential):
         assert concurrent[request_id] == sequential[request_id], (
-            f"{request_id} diverged under preemption: concurrent "
+            f"[{mode.value}] {request_id} diverged under preemption: concurrent "
             f"{concurrent[request_id]} vs sequential {sequential[request_id]}"
         )
 
@@ -246,9 +310,10 @@ def test_guard_boundary_is_exactly_num_blocks_minus_margin():
 # --- FCFS -------------------------------------------------------------------
 
 
-def test_strict_fcfs_no_backfilling():
+@pytest.mark.parametrize("mode", MODES)
+def test_strict_fcfs_no_backfilling(mode):
     """A head that does not fit blocks everything behind it, including one that would."""
-    scheduler, allocator = _stub_scheduler(num_blocks=8)
+    scheduler, allocator = _stub_scheduler(num_blocks=8, mode=mode)
 
     # Occupies 6 of 8 blocks once admitted, leaving 2 free.
     assert scheduler.add_request(_request("big", 6 * BLOCK_SIZE, 4))
@@ -271,8 +336,14 @@ def test_strict_fcfs_no_backfilling():
     )
 
 
-def test_finished_sequence_frees_blocks_immediately():
-    scheduler, allocator = _stub_scheduler(num_blocks=AMPLE_POOL_BLOCKS)
+@pytest.mark.parametrize("mode", MODES)
+def test_finished_sequence_frees_blocks_immediately(mode):
+    """Blocks come back as soon as a sequence finishes, and the pool ends whole.
+
+    True in both modes. *When* within a step they come back differs, and
+    `test_fused_defers_mid_step_reclamation` is the test for that.
+    """
+    scheduler, allocator = _stub_scheduler(num_blocks=AMPLE_POOL_BLOCKS, mode=mode)
     assert scheduler.add_request(_request("short", 16, 2))
     assert scheduler.add_request(_request("long", 16, 6))
 
@@ -293,9 +364,16 @@ def test_finished_sequence_frees_blocks_immediately():
 # --- preemption -------------------------------------------------------------
 
 
-def test_victim_set_is_never_the_entire_running_set():
-    """Checked per step, on a pool small enough to preempt constantly."""
-    scheduler, _ = _stub_scheduler(num_blocks=GROWTH_POOL_BLOCKS)
+@pytest.mark.parametrize("mode", MODES)
+def test_victim_set_is_never_the_entire_running_set(mode):
+    """Checked per step, on a pool small enough to preempt constantly.
+
+    Parametrized because FUSED mode holds every batch member's blocks across the
+    whole forward, so it reaches exhaustion sooner and evicts more. The invariant
+    still follows from the admission guard -- everything holding a block is in the
+    running set and therefore evictable -- but the harder case deserves the test.
+    """
+    scheduler, _ = _stub_scheduler(num_blocks=GROWTH_POOL_BLOCKS, mode=mode)
     for request in GROWTH_REQUESTS:
         scheduler.add_request(request)
 
@@ -313,13 +391,14 @@ def test_victim_set_is_never_the_entire_running_set():
 
     assert scheduler.events_of(EventKind.PREEMPT), "test did not exercise preemption"
     print(
-        f"\nvictim-set invariant held over {steps} steps and "
+        f"\n[{mode.value}] victim-set invariant held over {steps} steps and "
         f"{len(scheduler.events_of(EventKind.PREEMPT))} preemptions"
     )
 
 
-def test_preemption_count_is_durable():
-    scheduler, _ = _stub_scheduler(num_blocks=GROWTH_POOL_BLOCKS)
+@pytest.mark.parametrize("mode", MODES)
+def test_preemption_count_is_durable(mode):
+    scheduler, _ = _stub_scheduler(num_blocks=GROWTH_POOL_BLOCKS, mode=mode)
     for request in GROWTH_REQUESTS:
         scheduler.add_request(request)
     scheduler.run_to_completion()
@@ -330,7 +409,7 @@ def test_preemption_count_is_durable():
     for event in preempt_events:
         tally[event.request_id] = tally.get(event.request_id, 0) + 1
 
-    print(f"\npreemption_count per request: {counts}")
+    print(f"\n[{mode.value}] preemption_count per request: {counts}")
     assert any(count > 0 for count in counts.values())
     # Survived every requeue and readmission: the count equals the number of
     # preempt events for that request, not just the last one.
@@ -338,12 +417,15 @@ def test_preemption_count_is_durable():
         assert count == tally.get(request_id, 0)
 
 
-def test_preemption_count_is_never_consulted():
+@pytest.mark.parametrize("mode", MODES)
+def test_preemption_count_is_never_consulted(mode):
     """Scheduling must be invariant to the telemetry counter's value."""
-    baseline, scheduler_a = _run_concurrently(GROWTH_REQUESTS, num_blocks=GROWTH_POOL_BLOCKS)
+    baseline, scheduler_a = _run_concurrently(
+        GROWTH_REQUESTS, num_blocks=GROWTH_POOL_BLOCKS, mode=mode
+    )
     trace_a = [(e.kind, e.request_id) for e in scheduler_a.events]
 
-    scheduler_b, _ = _stub_scheduler(num_blocks=GROWTH_POOL_BLOCKS)
+    scheduler_b, _ = _stub_scheduler(num_blocks=GROWTH_POOL_BLOCKS, mode=mode)
     for index, request in enumerate(GROWTH_REQUESTS):
         assert scheduler_b.add_request(request)
         # Seed wildly different histories before anything runs.
@@ -358,8 +440,9 @@ def test_preemption_count_is_never_consulted():
 # --- event log --------------------------------------------------------------
 
 
-def test_event_log_records_every_decision_with_timestamps():
-    scheduler, _ = _stub_scheduler(num_blocks=GROWTH_POOL_BLOCKS)
+@pytest.mark.parametrize("mode", MODES)
+def test_event_log_records_every_decision_with_timestamps(mode):
+    scheduler, _ = _stub_scheduler(num_blocks=GROWTH_POOL_BLOCKS, mode=mode)
     assert scheduler.add_request(_request("huge", 4096, 4)) is False
     for request in GROWTH_REQUESTS:
         scheduler.add_request(request)
@@ -383,7 +466,8 @@ def test_event_log_records_every_decision_with_timestamps():
         admits = [e for e in scheduler.events_of(EventKind.ADMIT) if e.request_id == request_id]
         assert len(admits) == 1 + seq.preemption_count
 
-    print(f"\nevent log: {len(scheduler.events)} events across {len(kinds)} kinds")
+    print(f"\n[{mode.value}] event log: {len(scheduler.events)} events "
+          f"across {len(kinds)} kinds")
 
 
 def test_event_log_uses_an_injectable_clock():
@@ -455,14 +539,29 @@ def _model_requests():
     ]
 
 
-def _model_scheduler(engine, num_blocks: int, block_size: int = BLOCK_SIZE):
+def _model_scheduler(
+    engine,
+    num_blocks: int,
+    block_size: int = BLOCK_SIZE,
+    mode: ExecutionMode = ExecutionMode.UNFUSED,
+):
+    """Model-tier scheduler. Defaults to UNFUSED: this file's model-tier claims
+    are exact equalities, which is a property of the unfused path."""
     allocator = BlockAllocator(num_blocks=num_blocks, block_size=block_size)
     cache = engine.new_paged_cache(num_blocks, block_size)
-    return Scheduler(Qwen2Executor(engine, cache, allocator), allocator), allocator
+    return (
+        Scheduler(Qwen2Executor(engine, cache, allocator), allocator, mode=mode),
+        allocator,
+    )
 
 
 def test_model_concurrent_matches_sequential(runtime):
-    """The real gate, on the real model: identical tokens, not close."""
+    """The real gate, on the real model: identical tokens, not close.
+
+    UNFUSED. Byte-identity holds because no sequence's arithmetic depends on what
+    else is resident. `tests/test_fused.py` is where the fused path is held to the
+    unfused one, to a tolerance declared there.
+    """
     device, engine = runtime
     torch.manual_seed(SEED)
     requests = _model_requests()
@@ -560,15 +659,20 @@ def _event_index(events, kind: EventKind, request_id: str) -> list[int]:
     ]
 
 
-def test_required_preemption_fixture():
+@pytest.mark.parametrize("mode", MODES)
+def test_required_preemption_fixture(mode):
     """Three blocks, block size four. A older, B newer, both on block boundaries.
 
     B is squeezed out exactly once, waits while A runs to completion, and is only
     readmitted once A's blocks come back. Every assertion below is on the event
     log rather than on internal state, so it describes observable behaviour.
+
+    The trace is identical in both execution modes. It happens not to depend on
+    mid-step reclamation: A is alone by the time it finishes, so there is nobody
+    behind it in that step to hand blocks to.
     """
     scheduler, allocator = _stub_scheduler(
-        num_blocks=FIXTURE_NUM_BLOCKS, block_size=FIXTURE_BLOCK_SIZE
+        num_blocks=FIXTURE_NUM_BLOCKS, block_size=FIXTURE_BLOCK_SIZE, mode=mode
     )
     a = _request("A", FIXTURE_PROMPT_LEN, FIXTURE_MAX_NEW)
     b = _request("B", FIXTURE_PROMPT_LEN, FIXTURE_MAX_NEW)
@@ -593,7 +697,7 @@ def test_required_preemption_fixture():
     preempts_b = _event_index(events, EventKind.PREEMPT, "B")
     finishes_a = _event_index(events, EventKind.FINISH, "A")
 
-    print(f"\nrequired fixture: {turns} turns, "
+    print(f"\n[{mode.value}] required fixture: {turns} turns, "
           f"{FIXTURE_NUM_BLOCKS} blocks of {FIXTURE_BLOCK_SIZE}")
     for event in events:
         print(f"  step {event.step}  {event.kind.value:<9} {event.request_id}  "
@@ -630,10 +734,11 @@ def test_required_preemption_fixture():
     assert len(scheduler.finished["B"].generated) == FIXTURE_MAX_NEW
 
 
-def test_required_fixture_recompute_is_byte_identical():
+@pytest.mark.parametrize("mode", MODES)
+def test_required_fixture_recompute_is_byte_identical(mode):
     """B's output in the fixture equals B's output when never preempted."""
     scheduler, _ = _stub_scheduler(
-        num_blocks=FIXTURE_NUM_BLOCKS, block_size=FIXTURE_BLOCK_SIZE
+        num_blocks=FIXTURE_NUM_BLOCKS, block_size=FIXTURE_BLOCK_SIZE, mode=mode
     )
     assert scheduler.add_request(_request("A", FIXTURE_PROMPT_LEN, FIXTURE_MAX_NEW))
     assert scheduler.add_request(_request("B", FIXTURE_PROMPT_LEN, FIXTURE_MAX_NEW))
@@ -641,7 +746,7 @@ def test_required_fixture_recompute_is_byte_identical():
     assert scheduler.finished["B"].preemption_count == 1
 
     alone, reference = _stub_scheduler(
-        num_blocks=RECOMPUTE_AMPLE_BLOCKS, block_size=FIXTURE_BLOCK_SIZE
+        num_blocks=RECOMPUTE_AMPLE_BLOCKS, block_size=FIXTURE_BLOCK_SIZE, mode=mode
     )
     assert alone.add_request(_request("B", FIXTURE_PROMPT_LEN, FIXTURE_MAX_NEW))
     untouched = alone.run_to_completion()
@@ -653,22 +758,24 @@ def test_required_fixture_recompute_is_byte_identical():
     )
 
 
-def test_one_preemption_is_fixture_specific_not_a_global_cap():
+@pytest.mark.parametrize("mode", MODES)
+def test_one_preemption_is_fixture_specific_not_a_global_cap(mode):
     """The scheduler imposes no limit; the fixture's bound of one is its own."""
-    scheduler, _ = _stub_scheduler(num_blocks=GROWTH_POOL_BLOCKS)
+    scheduler, _ = _stub_scheduler(num_blocks=GROWTH_POOL_BLOCKS, mode=mode)
     for request in GROWTH_REQUESTS:
         assert scheduler.add_request(request)
     scheduler.run_to_completion()
 
     counts = {rid: seq.preemption_count for rid, seq in scheduler.finished.items()}
-    print(f"\nno global cap: preemption counts {counts}")
+    print(f"\n[{mode.value}] no global cap: preemption counts {counts}")
     assert max(counts.values()) > 1, (
         "no request was preempted more than once, so this cannot distinguish "
         "'no cap' from 'a cap of one'"
     )
 
 
-def test_real_pool_exhaustion_completes_every_request():
+@pytest.mark.parametrize("mode", MODES)
+def test_real_pool_exhaustion_completes_every_request(mode):
     """Exhaust the real configured pool: no deadlock, no loss, no truncation."""
     from engine.cache import NUM_GPU_BLOCKS
 
@@ -676,7 +783,9 @@ def test_real_pool_exhaustion_completes_every_request():
         _request(f"x{index}", EXHAUSTION_PROMPT_LEN, EXHAUSTION_MAX_NEW)
         for index in range(EXHAUSTION_REQUESTS)
     ]
-    scheduler, allocator = _stub_scheduler(num_blocks=NUM_GPU_BLOCKS, block_size=BLOCK_SIZE)
+    scheduler, allocator = _stub_scheduler(
+        num_blocks=NUM_GPU_BLOCKS, block_size=BLOCK_SIZE, mode=mode
+    )
     assert allocator.num_blocks == NUM_GPU_BLOCKS
     assert allocator.block_size == BLOCK_SIZE
     for request in requests:
@@ -689,7 +798,7 @@ def test_real_pool_exhaustion_completes_every_request():
     )
     preempts = scheduler.events_of(EventKind.PREEMPT)
     print(
-        f"\nreal pool {NUM_GPU_BLOCKS} blocks x {BLOCK_SIZE}: "
+        f"\n[{mode.value}] real pool {NUM_GPU_BLOCKS} blocks x {BLOCK_SIZE}: "
         f"{EXHAUSTION_REQUESTS} requests demanding {demanded} blocks "
         f"({demanded / NUM_GPU_BLOCKS:.1f}x the pool), "
         f"{len(preempts)} preemptions, "
@@ -707,7 +816,7 @@ def test_real_pool_exhaustion_completes_every_request():
             f"expected {request.max_new_tokens}"
         )
     # Correct output, against each request run alone.
-    sequential = _run_sequentially(requests, num_blocks=NUM_GPU_BLOCKS)
+    sequential = _run_sequentially(requests, num_blocks=NUM_GPU_BLOCKS, mode=mode)
     for request in requests:
         assert outputs[request.request_id] == sequential[request.request_id], (
             f"{request.request_id} diverged under exhaustion"
@@ -719,7 +828,7 @@ def test_real_pool_exhaustion_completes_every_request():
 
 @pytest.mark.parametrize("prompt_len,pool_blocks", RECOMPUTE_CASES)
 def test_model_recompute_is_byte_identical(runtime, prompt_len, pool_blocks):
-    """THE Step 5 gate, on the real model.
+    """THE Step 5 gate, on the real model. UNFUSED, where the claim is exact.
 
     A preempted-and-replayed request must produce exactly the tokens it produces
     when it is never touched. This is the one place the numerics of recompute are
@@ -727,6 +836,9 @@ def test_model_recompute_is_byte_identical(runtime, prompt_len, pool_blocks):
     multi-token prefill, where the untouched run built the same KV one token at a
     time. Those are different reduction orders, so the KV is not bitwise equal,
     and a token could flip. Only measurement settles it.
+
+    `tests/test_fused.py::test_fused_recompute_matches_unfused` carries the same
+    claim into the fused path, where it is a tolerance rather than an equality.
     """
     device, engine = runtime
     torch.manual_seed(SEED)
@@ -781,3 +893,128 @@ def test_model_recompute_is_byte_identical(runtime, prompt_len, pool_blocks):
         f"[{device}] recompute changed the answer at prompt_len={prompt_len}: "
         f"preempted {preempted['B']} vs untouched {untouched['B']}"
     )
+
+
+# --- Step 5b: what the two execution modes share, and what they do not -------
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_step_issues_one_call_per_running_sequence_or_one_in_total(mode):
+    """The scheduler's half of the fusion claim: how many calls a step makes.
+
+    FUSED must make exactly one, whatever the running-set size. UNFUSED must make
+    one per sequence that ran, which is what gives the counter teeth -- if both
+    modes made the same number of calls, counting them would prove nothing.
+
+    This tier can only see calls into the executor. Whether one call is really one
+    forward pass is a claim about the model, and
+    `tests/test_fused.py::test_fused_model_makes_exactly_one_forward_pass_per_step`
+    counts the engine's own passes to settle it.
+    """
+    scheduler, _ = _stub_scheduler(num_blocks=AMPLE_POOL_BLOCKS, mode=mode)
+    for request in MIXED_REQUESTS:
+        assert scheduler.add_request(request)
+
+    executor = scheduler.executor
+    widths: list[int] = []
+    while scheduler.waiting or scheduler.running:
+        before = executor.calls
+        result = scheduler.step()
+        made = executor.calls - before
+        widths.append(result.batch_size)
+
+        if mode is ExecutionMode.FUSED:
+            assert made == 1, (
+                f"step {result.step} ran {result.batch_size} sequences in {made} calls; "
+                "fusion means one"
+            )
+        else:
+            assert made == result.batch_size, (
+                f"step {result.step} ran {result.batch_size} sequences in {made} calls"
+            )
+
+    print(f"\n[{mode.value}] running-set widths per step: {widths}")
+    print(f"[{mode.value}] executor calls: single={executor.forward_calls} "
+          f"batched={executor.batch_calls}")
+
+    # The fixture has to actually vary the running-set size, or "regardless of
+    # running-set size" is untested.
+    assert max(widths) > 1, "no step ever ran more than one sequence"
+    assert len(set(widths)) > 1, "the running-set size never changed"
+
+    if mode is ExecutionMode.FUSED:
+        assert executor.forward_calls == 0, "fused mode fell back to single forwards"
+        assert executor.batch_calls == len(widths)
+    else:
+        assert executor.batch_calls == 0
+        assert executor.forward_calls == sum(widths) > len(widths)
+
+
+# Three blocks of four, no admission margin, and A finishing on its prefill.
+# UNFUSED reclaims A's two blocks inside step 1 and admits B behind it; FUSED
+# cannot, because A holds those blocks for the whole of the step's one forward.
+RECLAIM_NUM_BLOCKS = 3
+RECLAIM_BLOCK_SIZE = 4
+RECLAIM_PROMPT_LEN = 8
+
+
+def _reclaim_requests():
+    return (
+        _request("A", RECLAIM_PROMPT_LEN, 1),
+        _request("B", RECLAIM_PROMPT_LEN, 4),
+    )
+
+
+def _run_reclaim_fixture(mode: ExecutionMode):
+    scheduler, allocator = _stub_scheduler(
+        num_blocks=RECLAIM_NUM_BLOCKS,
+        margin=0,
+        block_size=RECLAIM_BLOCK_SIZE,
+        mode=mode,
+    )
+    for request in _reclaim_requests():
+        assert scheduler.add_request(request), "the guard should not reject these"
+
+    admitted_per_step: list[tuple[str, ...]] = []
+    while scheduler.waiting or scheduler.running:
+        result = scheduler.step()
+        admitted_per_step.append(result.admitted)
+        assert len(admitted_per_step) <= 12, "fixture did not converge"
+    return scheduler, allocator, admitted_per_step
+
+
+def test_fused_defers_mid_step_reclamation():
+    """The one behavioural cost of fusion, pinned to a fixture rather than prose.
+
+    UNFUSED runs each sequence's forward as it is scheduled, so A -- which
+    finishes on its own prefill -- returns its blocks before the queue head is
+    looked at again, and B is admitted in the same step. FUSED plans the whole
+    step before running anything, so A still holds those blocks when B's
+    admission is tested, and B waits a step.
+
+    This costs a step. It does not cost correctness: both modes produce the same
+    tokens, because a deferred admission is just a later admission and recompute
+    is transparent.
+    """
+    unfused, unfused_pool, unfused_admits = _run_reclaim_fixture(ExecutionMode.UNFUSED)
+    fused, fused_pool, fused_admits = _run_reclaim_fixture(ExecutionMode.FUSED)
+
+    print(f"\nadmissions per step, unfused: {unfused_admits}")
+    print(f"admissions per step, fused  : {fused_admits}")
+
+    assert unfused_admits[0] == ("A", "B"), (
+        "unfused did not reuse A's blocks inside step 1, so this fixture no "
+        "longer demonstrates mid-step reclamation"
+    )
+    assert fused_admits[0] == ("A",)
+    assert fused_admits[1] == ("B",)
+    assert len(fused_admits) == len(unfused_admits) + 1
+
+    # Same answers, one step later.
+    unfused_out = {rid: tuple(seq.generated) for rid, seq in unfused.finished.items()}
+    fused_out = {rid: tuple(seq.generated) for rid, seq in fused.finished.items()}
+    assert fused_out == unfused_out
+
+    for pool in (unfused_pool, fused_pool):
+        assert pool.num_free == RECLAIM_NUM_BLOCKS
+        assert pool.num_allocated == 0

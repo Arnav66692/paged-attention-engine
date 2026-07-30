@@ -10,14 +10,26 @@ read from the installed package, including the details that matter numerically:
 RMSNorm accumulates in float32 and casts back, the rotary tables are built in
 float32 by the same matmul-then-concat expression, and attention scales by
 head_dim ** -0.5.
+
+Step 5b adds a second entry point, `forward_batch_prereserved`, which runs a
+whole batch in one pass. Both entry points go through `_run_layers`, so the two
+differ only in what they hand the attention step and in how many rows come out;
+the model itself is written once.
 """
 
 from dataclasses import dataclass
+from typing import Callable, Sequence
 
 import torch
 import torch.nn.functional as F
 
-from engine.attention import AttentionBackend, ContiguousBackend, PagedBackend
+from engine.attention import (
+    AttentionBackend,
+    BatchInput,
+    ContiguousBackend,
+    FusedPagedAttention,
+    PagedBackend,
+)
 from engine.cache import (
     BLOCK_SIZE,
     BlockAllocator,
@@ -165,6 +177,14 @@ class Qwen2Engine:
         self.dtype = dtype
         self.inv_freq = build_inv_freq(dims.head_dim, dims.rope_theta, device)
 
+        # Telemetry, and the only thing that can tell fusion from a loop. One
+        # increment is one traversal of the layer stack, whatever the batch size,
+        # so a "fused" executor that secretly iterates raises this by N per step
+        # instead of 1 while passing every numerical test. Nothing reads it to
+        # make a decision; tests/test_fused.py reads it to prove the batch is one
+        # pass. See `_run_layers`.
+        self.forward_pass_count = 0
+
     # --- construction ------------------------------------------------------
 
     @classmethod
@@ -264,30 +284,34 @@ class Qwen2Engine:
         hidden: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        backend: AttentionBackend,
+        attend: Callable[
+            [int, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor
+        ],
         layer_idx: int,
     ) -> torch.Tensor:
-        """Project and rotate Q/K/V, then let the backend decide where KV lives.
+        """Project and rotate Q/K/V, then let `attend` decide where KV lives.
 
-        Everything below the rotary embedding is storage-agnostic: the backend
-        stores this layer's K/V and attends over the whole sequence. Contiguous
-        and paged differ only inside `attend`.
+        Everything below the rotary embedding is storage-agnostic: `attend`
+        stores this layer's K/V and attends over the whole sequence. Contiguous,
+        paged and fused differ only inside it. The batch dimension is read off
+        `hidden`, which is 1 for the single-sequence backends and the running-set
+        size for a fused step.
         """
         dims = self.dims
-        n = hidden.shape[1]
+        batch, n = hidden.shape[0], hidden.shape[1]
 
         q = F.linear(hidden, layer.q_proj_weight, layer.q_proj_bias)
         k = F.linear(hidden, layer.k_proj_weight, layer.k_proj_bias)
         v = F.linear(hidden, layer.v_proj_weight, layer.v_proj_bias)
 
-        q = q.view(1, n, dims.num_heads, dims.head_dim).transpose(1, 2)
-        k = k.view(1, n, dims.num_kv_heads, dims.head_dim).transpose(1, 2)
-        v = v.view(1, n, dims.num_kv_heads, dims.head_dim).transpose(1, 2)
+        q = q.view(batch, n, dims.num_heads, dims.head_dim).transpose(1, 2)
+        k = k.view(batch, n, dims.num_kv_heads, dims.head_dim).transpose(1, 2)
+        v = v.view(batch, n, dims.num_kv_heads, dims.head_dim).transpose(1, 2)
 
         q, k = apply_rope(q, k, cos, sin)
 
-        attn = backend.attend(layer_idx, q, k, v)
-        attn = attn.transpose(1, 2).reshape(1, n, dims.num_heads * dims.head_dim)
+        attn = attend(layer_idx, q, k, v)
+        attn = attn.transpose(1, 2).reshape(batch, n, dims.num_heads * dims.head_dim)
         return F.linear(attn, layer.o_proj_weight)
 
     def _mlp(self, layer: LayerWeights, hidden: torch.Tensor) -> torch.Tensor:
@@ -295,40 +319,28 @@ class Qwen2Engine:
         up = F.linear(hidden, layer.up_proj_weight)
         return F.linear(F.silu(gate) * up, layer.down_proj_weight)
 
-    @torch.inference_mode()
-    def forward(
-        self, token_ids: torch.Tensor, positions: torch.Tensor, backend: AttentionBackend
+    def _run_layers(
+        self,
+        hidden: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attend: Callable[
+            [int, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor
+        ],
     ) -> torch.Tensor:
-        """Run one forward pass and return logits for the final query position.
+        """Every decoder layer, then the final norm. Returns (batch, n, hidden).
 
-        `token_ids` and `positions` are 1-D and the same length. The backend
-        reserves room first so every layer writes at the same offset, and the
-        sequence length only moves once all of them have.
+        The single entry to the model. Both `forward_prereserved` and
+        `forward_batch_prereserved` come through here, which is what makes "the
+        fused path differs only in batching and masking" a structural fact rather
+        than a claim. One call is one forward pass, counted.
         """
-        if token_ids.ndim != 1 or positions.ndim != 1:
-            raise ValueError("token_ids and positions must be 1-D")
-        if token_ids.shape[0] != positions.shape[0]:
-            raise ValueError(
-                f"{token_ids.shape[0]} tokens but {positions.shape[0]} positions"
-            )
-
-        n = token_ids.shape[0]
-        reservation = backend.begin_forward(n)
-        if not reservation.ok:
-            # The allocator reports exhaustion as a value, which is what lets a
-            # scheduler preempt instead of unwinding. There is no scheduler yet,
-            # so at this layer it becomes an error rather than being swallowed.
-            raise RuntimeError(
-                f"cache exhausted reserving {n} token(s): {reservation.status.value}"
-            )
-
-        hidden = self.weights.embed_tokens[token_ids].unsqueeze(0)
-        cos, sin = build_cos_sin(self.inv_freq, positions.unsqueeze(0), hidden.dtype)
+        self.forward_pass_count += 1
 
         for layer_idx, layer in enumerate(self.weights.layers):
             residual = hidden
             hidden = rms_norm(hidden, layer.input_layernorm_weight, self.dims.rms_norm_eps)
-            hidden = residual + self._attention(layer, hidden, cos, sin, backend, layer_idx)
+            hidden = residual + self._attention(layer, hidden, cos, sin, attend, layer_idx)
 
             residual = hidden
             hidden = rms_norm(
@@ -336,10 +348,111 @@ class Qwen2Engine:
             )
             hidden = residual + self._mlp(layer, hidden)
 
+        return rms_norm(hidden, self.weights.final_norm_weight, self.dims.rms_norm_eps)
+
+    @staticmethod
+    def _check_shapes(token_ids: torch.Tensor, positions: torch.Tensor) -> None:
+        if token_ids.ndim != 1 or positions.ndim != 1:
+            raise ValueError("token_ids and positions must be 1-D")
+        if token_ids.shape[0] != positions.shape[0]:
+            raise ValueError(
+                f"{token_ids.shape[0]} tokens but {positions.shape[0]} positions"
+            )
+
+    @torch.inference_mode()
+    def forward(
+        self, token_ids: torch.Tensor, positions: torch.Tensor, backend: AttentionBackend
+    ) -> torch.Tensor:
+        """Reserve room for this pass, then run it. Logits for the final position.
+
+        `token_ids` and `positions` are 1-D and the same length. The backend
+        reserves room first so every layer writes at the same offset, and the
+        sequence length only moves once all of them have.
+        """
+        self._check_shapes(token_ids, positions)
+
+        n = token_ids.shape[0]
+        reservation = backend.begin_forward(n)
+        if not reservation.ok:
+            # The allocator reports exhaustion as a value, which is what lets a
+            # scheduler preempt instead of unwinding. A caller that owns capacity
+            # decisions reserves for itself and calls `forward_prereserved`; here
+            # there is nobody to preempt, so it becomes an error.
+            raise RuntimeError(
+                f"cache exhausted reserving {n} token(s): {reservation.status.value}"
+            )
+        return self.forward_prereserved(token_ids, positions, backend)
+
+    @torch.inference_mode()
+    def forward_prereserved(
+        self, token_ids: torch.Tensor, positions: torch.Tensor, backend: AttentionBackend
+    ) -> torch.Tensor:
+        """One sequence whose `begin_forward` the caller has already called.
+
+        Split out for the scheduler, which has to reserve *before* it decides what
+        else can run in the same step -- capacity is its decision, not the
+        model's -- and so cannot let the forward reserve on its behalf. Purely a
+        matter of who calls `begin_forward`: the arithmetic below is what `forward`
+        has always done.
+        """
+        self._check_shapes(token_ids, positions)
+
+        n = token_ids.shape[0]
+        hidden = self.weights.embed_tokens[token_ids].unsqueeze(0)
+        cos, sin = build_cos_sin(self.inv_freq, positions.unsqueeze(0), hidden.dtype)
+        hidden = self._run_layers(hidden, cos, sin, backend.attend)
         backend.end_forward(n)
 
-        hidden = rms_norm(hidden, self.weights.final_norm_weight, self.dims.rms_norm_eps)
         return F.linear(hidden[0, -1], self.weights.lm_head_weight)
+
+    @torch.inference_mode()
+    def forward_batch_prereserved(
+        self, inputs: Sequence[BatchInput]
+    ) -> torch.Tensor:
+        """ONE forward over a whole batch. Returns (batch, vocab_size).
+
+        Step 5b, and the only thing in this file that runs more than one sequence
+        at a time. Every sequence must already have reserved, for the same reason
+        as `forward_prereserved`: the scheduler interleaves reservation with its
+        admission and eviction decisions and the model never second-guesses it.
+
+        Sequences have different lengths, so both axes are padded to the widest
+        member and `FusedPagedAttention` masks the difference away. Padded rows
+        are embedded, normalised, projected and thrown out; they cannot reach a
+        real row, because every operation here except attention is
+        position-local and the fused scatter stores only real tokens.
+
+        Exactly one traversal of the layer stack happens here regardless of how
+        many sequences arrive, which is what `forward_pass_count` exists to let a
+        test prove.
+        """
+        if not inputs:
+            raise ValueError("forward_batch_prereserved needs at least one sequence")
+
+        fused = FusedPagedAttention(inputs, self.dims.num_kv_groups, self.dims.attn_scale)
+        batch, width = fused.batch_size, fused.max_query_len
+
+        # Pads carry token id 0 and position 0. Both are harmless: their rows are
+        # discarded, and a zero embedding through RMSNorm is 0 rather than NaN.
+        token_ids = torch.zeros((batch, width), dtype=torch.long, device=self.device)
+        positions = torch.zeros((batch, width), dtype=torch.long, device=self.device)
+        for row, item in enumerate(inputs):
+            count = len(item.token_ids)
+            token_ids[row, :count] = torch.tensor(
+                item.token_ids, dtype=torch.long, device=self.device
+            )
+            positions[row, :count] = torch.tensor(
+                item.positions, dtype=torch.long, device=self.device
+            )
+
+        hidden = self.weights.embed_tokens[token_ids]
+        cos, sin = build_cos_sin(self.inv_freq, positions, hidden.dtype)
+        hidden = self._run_layers(hidden, cos, sin, fused.attend)
+        fused.end_forward()
+
+        rows = torch.arange(batch, dtype=torch.long, device=self.device)
+        last = hidden[rows, fused.last_query_row]
+        return F.linear(last, self.weights.lm_head_weight)
 
     # --- decode loop -------------------------------------------------------
 

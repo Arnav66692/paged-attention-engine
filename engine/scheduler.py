@@ -38,18 +38,36 @@ able to allocate, so the victim set is never the entire running set.
 `preemption_count` is durable across requeue and readmission. It is telemetry
 for the Step 6 plots. Nothing in this file reads it to make a decision, and
 `tests/test_sched.py` asserts scheduling is invariant to it.
+
+STEP 5B: TWO EXECUTION MODES, one set of decisions. `ExecutionMode.UNFUSED` is
+Step 4's path -- one forward per sequence per step -- and it is kept as the
+reference, not as a fallback. `ExecutionMode.FUSED` is the shipping path and
+runs the whole step in one batched forward. Which sequences run, which are
+admitted and which are evicted is decided by the same code either way; the modes
+differ only in *when* the forwards happen, which is `_submit` and `_flush`.
+
+That timing difference has one visible consequence, and it is not hidden. In
+UNFUSED mode a sequence that finishes returns its blocks before the next
+sequence in the same step is considered, so a later sequence can reuse them
+immediately. In FUSED mode there is one forward and every member of the batch
+holds its blocks for the whole of it, so reclamation cannot happen until the
+step ends. Under memory pressure FUSED therefore admits slightly later and
+preempts slightly more. It does not change any sequence's output -- recompute is
+transparent, which is the Step 5 gate -- and
+`tests/test_sched.py::test_fused_defers_mid_step_reclamation` pins the
+difference to a three-block fixture rather than leaving it as prose.
 """
 
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Protocol
+from typing import Callable, Protocol, Sequence as TypingSequence
 
 import torch
 
-from engine.attention import AttentionBackend
-from engine.cache import ADMISSION_MARGIN_BLOCKS, BlockAllocator
+from engine.attention import AttentionBackend, BatchInput
+from engine.cache import ADMISSION_MARGIN_BLOCKS, AllocResult, BlockAllocator
 
 
 class EventKind(Enum):
@@ -58,6 +76,25 @@ class EventKind(Enum):
     PREEMPT = "preempt"
     RECOMPUTE = "recompute"
     REJECT = "reject"
+
+
+class ExecutionMode(Enum):
+    """How a step's forwards are issued. Not a policy -- both are supported.
+
+    UNFUSED  One forward per sequence per step. Step 4's path. Every sequence's
+             arithmetic is bit-for-bit what it would be running alone, which is
+             what makes concurrent-equals-sequential an equality rather than a
+             tolerance. Kept permanently as the reference the fused path is
+             checked against.
+    FUSED    One batched forward per step, whatever the running-set size. Step
+             5b, and the path the throughput number is measured on. Padding and
+             batched reductions mean it agrees with UNFUSED to a tolerance rather
+             than exactly, so UNFUSED remains the thing equality is asserted
+             against.
+    """
+
+    UNFUSED = "unfused"
+    FUSED = "fused"
 
 
 @dataclass(frozen=True)
@@ -123,6 +160,13 @@ class Sequence:
     # any scheduling decision.
     preemption_count: int = 0
 
+    # Populated only when the scheduler is built with record_logits=True.
+    # `step_logits[k]` is the logit vector that `generated[k]` was taken from,
+    # which stays aligned across preemption because a recompute appends exactly
+    # one token, just as a decode does. That alignment is what lets the fused and
+    # unfused runs be compared per token when their step boundaries differ.
+    step_logits: list[torch.Tensor] = field(default_factory=list)
+
     @property
     def request_id(self) -> str:
         return self.request.request_id
@@ -142,6 +186,21 @@ class Sequence:
 
 
 @dataclass(frozen=True)
+class ScheduledWork:
+    """One sequence's work for one step: the tokens to run and where they sit."""
+
+    seq: Sequence
+    token_ids: tuple[int, ...]
+    positions: tuple[int, ...]
+    is_prefill: bool
+
+    def as_input(self) -> BatchInput:
+        return BatchInput(
+            token_ids=self.token_ids, positions=self.positions, backend=self.seq.backend
+        )
+
+
+@dataclass(frozen=True)
 class StepResult:
     step: int
     admitted: tuple[str, ...]
@@ -151,20 +210,35 @@ class StepResult:
     running: int
     waiting: int
     free_blocks: int
+    # Sequences that actually ran a forward this step. In FUSED mode this is the
+    # width of the one batched call; in UNFUSED mode it is how many separate calls
+    # were made. A sequence evicted after being planned but before the flush is
+    # not counted, because it did not run.
+    batch_size: int = 0
 
 
 class Executor(Protocol):
-    """What the scheduler needs from a model. Narrow so tests can stub it."""
+    """What the scheduler needs from a model. Narrow so tests can stub it.
+
+    Reservation is separate from execution because capacity is the scheduler's
+    decision: it has to know a sequence's blocks are taken before it decides what
+    else fits in the same step, and in FUSED mode nothing runs until the step is
+    fully planned.
+    """
 
     def new_backend(self, seq_id: int) -> AttentionBackend: ...
 
+    def reserve(self, backend: AttentionBackend, num_tokens: int) -> AllocResult: ...
+
     def forward(
-        self, token_ids: list[int], positions: list[int], backend: AttentionBackend
+        self, token_ids: tuple[int, ...], positions: tuple[int, ...], backend: AttentionBackend
     ) -> torch.Tensor: ...
+
+    def forward_batch(self, inputs: TypingSequence[BatchInput]) -> torch.Tensor: ...
 
 
 class Qwen2Executor:
-    """Drives `Qwen2Engine.forward` over a paged cache for the scheduler."""
+    """Drives `Qwen2Engine` over a paged cache for the scheduler."""
 
     def __init__(self, engine, paged_cache, allocator: BlockAllocator) -> None:
         self.engine = engine
@@ -174,24 +248,35 @@ class Qwen2Executor:
     def new_backend(self, seq_id: int) -> AttentionBackend:
         return self.engine.new_paged_backend(self.cache, self.allocator, seq_id)
 
+    def reserve(self, backend: AttentionBackend, num_tokens: int) -> AllocResult:
+        return backend.begin_forward(num_tokens)
+
     def forward(
-        self, token_ids: list[int], positions: list[int], backend: AttentionBackend
+        self, token_ids: tuple[int, ...], positions: tuple[int, ...], backend: AttentionBackend
     ) -> torch.Tensor:
         device = self.engine.device
         ids = torch.tensor(token_ids, dtype=torch.long, device=device)
         pos = torch.tensor(positions, dtype=torch.long, device=device)
-        return self.engine.forward(ids, pos, backend)
+        return self.engine.forward_prereserved(ids, pos, backend)
+
+    def forward_batch(self, inputs: TypingSequence[BatchInput]) -> torch.Tensor:
+        return self.engine.forward_batch_prereserved(inputs)
 
 
 class Scheduler:
-    """Iteration-level scheduler over a single block pool.
+    """Iteration-level scheduler over a single block pool, in two execution modes.
 
-    One forward pass per running sequence per step. The sequences in a step are
-    *not* fused into a single batched matmul, so each sequence's arithmetic is
-    bit-for-bit what it would be running alone -- which is what makes the
-    concurrent-equals-sequential test an equality rather than a tolerance.
-    Fusing them is a throughput optimization that would trade that equality for
-    a tolerance, and it is not done here.
+    `ExecutionMode.UNFUSED` runs one forward per sequence per step, so each
+    sequence's arithmetic is bit-for-bit what it would be running alone -- which
+    is what makes the concurrent-equals-sequential test an equality rather than a
+    tolerance. It is the reference and is never removed.
+
+    `ExecutionMode.FUSED` runs the whole step in a single batched forward, which
+    is where the throughput comes from. It trades that equality for a declared
+    tolerance, so it does not replace the reference.
+
+    Both modes share every decision in this class. See the module docstring for
+    the one behavioural consequence of the difference.
     """
 
     def __init__(
@@ -200,6 +285,8 @@ class Scheduler:
         allocator: BlockAllocator,
         admission_margin_blocks: int = ADMISSION_MARGIN_BLOCKS,
         clock: Callable[[], float] = time.monotonic,
+        mode: ExecutionMode = ExecutionMode.FUSED,
+        record_logits: bool = False,
     ) -> None:
         if admission_margin_blocks < 0:
             raise ValueError(
@@ -209,6 +296,8 @@ class Scheduler:
         self.allocator = allocator
         self.admission_margin_blocks = admission_margin_blocks
         self.clock = clock
+        self.mode = mode
+        self.record_logits = record_logits
 
         self.waiting: deque[Sequence] = deque()
         self.running: list[Sequence] = []
@@ -219,6 +308,11 @@ class Scheduler:
         self._step = 0
         self._next_arrival = 0
         self._next_seq_id = 0
+
+        # This step's planned and completed work. `_pending` is only ever
+        # non-empty in FUSED mode, between planning and the flush.
+        self._pending: list[ScheduledWork] = []
+        self._ran: list[ScheduledWork] = []
 
     # --- capacity ----------------------------------------------------------
 
@@ -301,7 +395,7 @@ class Scheduler:
         return admitted
 
     def _start(self, seq: Sequence) -> None:
-        """Register with the allocator, prefill the whole history, take a token."""
+        """Register with the allocator and plan a prefill of the whole history."""
         is_recompute = bool(seq.generated)
         seq.seq_id = self._next_seq_id
         self._next_seq_id += 1
@@ -309,7 +403,7 @@ class Scheduler:
         seq.status = SequenceStatus.RUNNING
         self.running.append(seq)
 
-        history = seq.history
+        history = tuple(seq.history)
         self._log(
             EventKind.ADMIT,
             seq,
@@ -324,10 +418,70 @@ class Scheduler:
                 f"({seq.request.prompt_len} prompt + {len(seq.generated)} generated)",
             )
 
-        logits = self.executor.forward(history, list(range(len(history))), seq.backend)
-        self._append_token(seq, logits)
+        self._reserve(seq, len(history))
+        self._submit(
+            ScheduledWork(
+                seq=seq,
+                token_ids=history,
+                positions=tuple(range(len(history))),
+                is_prefill=True,
+            )
+        )
+
+    # --- execution ---------------------------------------------------------
+
+    def _reserve(self, seq: Sequence, num_tokens: int) -> None:
+        """Take the blocks this work needs, now that the capacity check passed.
+
+        Reserving here rather than inside the forward is what lets the next
+        sequence in the same step see the blocks as taken, in both modes. A
+        failure is a bug in the capacity checks above, not an expected outcome, so
+        it is an assertion and not a preemption.
+        """
+        reservation = self.executor.reserve(seq.backend, num_tokens)
+        if not reservation.ok:
+            raise AssertionError(
+                f"{seq.request_id}: reserving {num_tokens} token(s) failed with "
+                f"{reservation.status.value} after the capacity check passed"
+            )
+
+    def _submit(self, work: ScheduledWork) -> None:
+        """Queue this step's work, and in UNFUSED mode run it immediately.
+
+        Running immediately is what preserves Step 4's interleaving exactly: a
+        sequence that finishes here returns its blocks before the next sequence in
+        the same step is considered. In FUSED mode the work waits for `_flush`,
+        because there is one forward and every sequence in it holds its blocks for
+        the duration.
+        """
+        if self.mode is ExecutionMode.FUSED:
+            self._pending.append(work)
+            return
+
+        logits = self.executor.forward(work.token_ids, work.positions, work.seq.backend)
+        self._ran.append(work)
+        self._append_token(work.seq, logits)
+
+    def _flush(self) -> None:
+        """FUSED mode: one batched forward for the whole step, then take tokens."""
+        if self.mode is not ExecutionMode.FUSED or not self._pending:
+            return
+
+        batch = self._pending
+        self._pending = []
+        logits = self.executor.forward_batch(tuple(work.as_input() for work in batch))
+        if logits.shape[0] != len(batch):
+            raise AssertionError(
+                f"fused forward returned {logits.shape[0]} rows for a batch of {len(batch)}"
+            )
+
+        self._ran.extend(batch)
+        for row, work in enumerate(batch):
+            self._append_token(work.seq, logits[row])
 
     def _append_token(self, seq: Sequence, logits: torch.Tensor) -> None:
+        if self.record_logits:
+            seq.step_logits.append(logits.detach().cpu().clone())
         seq.generated.append(int(torch.argmax(logits).item()))
         if seq.is_finished:
             self._finish(seq)
@@ -345,6 +499,10 @@ class Scheduler:
     def _evict(self, seq: Sequence) -> None:
         """Preempt a running sequence: free its blocks, requeue it in FCFS order."""
         self.running.remove(seq)
+        # In FUSED mode this sequence may already be planned into the step's batch.
+        # It is losing the blocks that batch would read, so the work goes with it.
+        # In UNFUSED mode its forward has already happened and `_pending` is empty.
+        self._pending = [work for work in self._pending if work.seq is not seq]
         freed = self.allocator.free_sequence(seq.seq_id)
         seq.seq_id = None
         seq.backend = None
@@ -390,29 +548,42 @@ class Scheduler:
         )
         return victims
 
-    def _decode(self, seq: Sequence) -> None:
-        """One token for an already-resident sequence."""
+    def _plan_decode(self, seq: Sequence) -> None:
+        """Plan one token for an already-resident sequence."""
         last_token = seq.generated[-1]
         # That token occupies the position right after everything already cached.
         position = seq.history_len - 1
-        logits = self.executor.forward([last_token], [position], seq.backend)
-        self._append_token(seq, logits)
+        self._reserve(seq, 1)
+        self._submit(
+            ScheduledWork(
+                seq=seq,
+                token_ids=(last_token,),
+                positions=(position,),
+                is_prefill=False,
+            )
+        )
 
     def step(self) -> StepResult:
-        """One scheduling iteration."""
+        """One scheduling iteration.
+
+        The decisions below are identical in both execution modes. What differs is
+        that `_submit` runs each piece of work immediately in UNFUSED mode and
+        defers it to the single `_flush` forward in FUSED mode.
+        """
         self._step += 1
+        self._pending = []
+        self._ran = []
 
         admitted = self._admit()
         admitted_ids = {id(seq) for seq in admitted}
 
-        decoded: list[str] = []
         preempted: list[str] = []
         finished_before = set(self.finished)
 
         # Snapshot: the running set is mutated mid-loop by finishes and evictions.
         for seq in list(self.running):
             if id(seq) in admitted_ids:
-                continue  # already produced its token during prefill this step
+                continue  # its prefill already covers this step's token
             if seq.status is not SequenceStatus.RUNNING:
                 continue  # finished or evicted earlier in this same step
 
@@ -422,18 +593,22 @@ class Scheduler:
                 if seq.status is not SequenceStatus.RUNNING:
                     continue  # it was its own victim
 
-            self._decode(seq)
-            decoded.append(seq.request_id)
+            self._plan_decode(seq)
+
+        self._flush()
 
         return StepResult(
             step=self._step,
             admitted=tuple(seq.request_id for seq in admitted),
-            decoded=tuple(decoded),
+            # Only work that actually ran. A sequence planned and then evicted by a
+            # later sequence's `_make_room_for` never reaches `_ran`.
+            decoded=tuple(work.seq.request_id for work in self._ran if not work.is_prefill),
             finished=tuple(sorted(set(self.finished) - finished_before)),
             preempted=tuple(preempted),
             running=len(self.running),
             waiting=len(self.waiting),
             free_blocks=self.allocator.num_free,
+            batch_size=len(self._ran),
         )
 
     def run_to_completion(self, max_steps: int = 100_000) -> dict[str, tuple[int, ...]]:
