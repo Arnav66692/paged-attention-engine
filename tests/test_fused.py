@@ -73,12 +73,12 @@ SEED = 0
 # Absolute tolerance on logits, unfused vs fused, in float32. Declared here,
 # derived from the arithmetic, and fixed before anything was measured.
 #
-# It is NOT LOGIT_ATOL and NOT BF16_LOGIT_ATOL. Those bound different
+# It is NOT LOGIT_ATOL and NOT FP16_LOGIT_ATOL. Those bound different
 # comparisons -- this engine against HuggingFace, in two different dtypes -- and
 # carrying a constant across comparisons is how a tolerance stops being a
 # prediction and becomes a description of whatever the code happened to produce.
-# tests/test_parity.py's constant is deliberately not imported into this module,
-# and `test_fused_tolerance_is_declared_here` asserts it is absent.
+# Neither is imported into this module, and
+# `test_fused_tolerance_is_declared_here` asserts both names are absent.
 #
 # Both sides of this comparison are this engine: same weights, same dtype, same
 # device, the same `_run_layers`. They differ in two places and only two.
@@ -948,10 +948,15 @@ def test_fused_tolerance_is_declared_here():
     """
     assert FUSED_LOGIT_ATOL == 5e-3
     assert "LOGIT_ATOL" not in globals()
-    assert "BF16_LOGIT_ATOL" not in globals()
+    assert "FP16_LOGIT_ATOL" not in globals()
+
+    # Distinct from both of the other declared tolerances, checked against the
+    # files that own them rather than against remembered literals.
     import tests.test_parity as parity
+    import tests.test_parity_fp16 as parity_fp16
 
     assert FUSED_LOGIT_ATOL != parity.LOGIT_ATOL
+    assert FUSED_LOGIT_ATOL != parity_fp16.FP16_LOGIT_ATOL
 
 
 # --- throughput -------------------------------------------------------------
