@@ -18,6 +18,7 @@ for existing: without it that request livelocks the scheduler at zero throughput
 """
 
 import time
+from functools import lru_cache
 
 import pytest
 import torch
@@ -85,8 +86,12 @@ class StubExecutor:
         return logits
 
 
-def _stub_scheduler(num_blocks: int, margin: int = ADMISSION_MARGIN_BLOCKS):
-    allocator = BlockAllocator(num_blocks=num_blocks, block_size=BLOCK_SIZE)
+def _stub_scheduler(
+    num_blocks: int,
+    margin: int = ADMISSION_MARGIN_BLOCKS,
+    block_size: int = BLOCK_SIZE,
+):
+    allocator = BlockAllocator(num_blocks=num_blocks, block_size=block_size)
     executor = StubExecutor(allocator)
     return Scheduler(executor, allocator, admission_margin_blocks=margin), allocator
 
@@ -429,11 +434,17 @@ def runtime(request):
     return device, Qwen2Engine.from_hf_model(model)
 
 
-def _model_requests():
+@lru_cache(maxsize=None)
+def _base_ids() -> tuple[int, ...]:
+    """Token IDs of BASE_PROMPT, tokenized once per session."""
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(DEV_MODEL)
-    ids = tokenizer(BASE_PROMPT, add_special_tokens=False)["input_ids"]
+    return tuple(tokenizer(BASE_PROMPT, add_special_tokens=False)["input_ids"])
+
+
+def _model_requests():
+    ids = _base_ids()
     return [
         Request(
             request_id=f"m{index}",
@@ -444,9 +455,9 @@ def _model_requests():
     ]
 
 
-def _model_scheduler(engine, num_blocks: int):
-    allocator = BlockAllocator(num_blocks=num_blocks, block_size=BLOCK_SIZE)
-    cache = engine.new_paged_cache(num_blocks)
+def _model_scheduler(engine, num_blocks: int, block_size: int = BLOCK_SIZE):
+    allocator = BlockAllocator(num_blocks=num_blocks, block_size=block_size)
+    cache = engine.new_paged_cache(num_blocks, block_size)
     return Scheduler(Qwen2Executor(engine, cache, allocator), allocator), allocator
 
 
@@ -506,3 +517,267 @@ def test_model_scheduler_matches_generate_greedy(runtime):
             f"[{device}] {request.request_id}: scheduler output differs from "
             "generate_greedy, which parity pinned to HuggingFace"
         )
+
+
+# --- Step 5: preemption -----------------------------------------------------
+#
+# The gate is that recompute is transparent: a request that was preempted and
+# replayed must produce the identical tokens it would have produced untouched.
+# If that fails, preemption is not an optimisation with a cost, it is a
+# correctness bug, and every throughput number downstream is measuring a
+# different computation than the reference.
+
+# The required fixture, exactly as specified.
+FIXTURE_NUM_BLOCKS = 3
+FIXTURE_BLOCK_SIZE = 4
+FIXTURE_PROMPT_LEN = 4  # one whole block: both A and B start on a boundary
+FIXTURE_MAX_NEW = 4
+FIXTURE_MAX_TURNS = 8
+
+# Real-model recompute gate, as (B prompt_len, pool_blocks). Derived with the
+# stub, which schedules identically because admission and eviction depend only
+# on token *counts*, never on token values -- so the cheap tier can be used to
+# find a pool size that forces exactly one preemption, and the expensive tier
+# then only has to check the arithmetic.
+RECOMPUTE_BLOCK_SIZE = 4
+RECOMPUTE_FILLER_PROMPT_LEN = 16
+RECOMPUTE_FILLER_MAX_NEW = 16
+RECOMPUTE_B_MAX_NEW = 16
+RECOMPUTE_CASES = ((13, 13), (32, 18), (33, 18))
+RECOMPUTE_AMPLE_BLOCKS = 64
+
+# Real configured pool, driven into exhaustion.
+EXHAUSTION_REQUESTS = 40
+EXHAUSTION_PROMPT_LEN = 1600
+EXHAUSTION_MAX_NEW = 1600
+
+
+def _event_index(events, kind: EventKind, request_id: str) -> list[int]:
+    return [
+        index
+        for index, event in enumerate(events)
+        if event.kind is kind and event.request_id == request_id
+    ]
+
+
+def test_required_preemption_fixture():
+    """Three blocks, block size four. A older, B newer, both on block boundaries.
+
+    B is squeezed out exactly once, waits while A runs to completion, and is only
+    readmitted once A's blocks come back. Every assertion below is on the event
+    log rather than on internal state, so it describes observable behaviour.
+    """
+    scheduler, allocator = _stub_scheduler(
+        num_blocks=FIXTURE_NUM_BLOCKS, block_size=FIXTURE_BLOCK_SIZE
+    )
+    a = _request("A", FIXTURE_PROMPT_LEN, FIXTURE_MAX_NEW)
+    b = _request("B", FIXTURE_PROMPT_LEN, FIXTURE_MAX_NEW)
+
+    # Both start on a block boundary, which is what makes the trace exact.
+    assert a.prompt_len % FIXTURE_BLOCK_SIZE == 0
+    assert b.prompt_len % FIXTURE_BLOCK_SIZE == 0
+    assert scheduler.add_request(a)  # older
+    assert scheduler.add_request(b)  # newer
+
+    turns = 0
+    while scheduler.waiting or scheduler.running:
+        scheduler.step()
+        turns += 1
+        assert turns <= FIXTURE_MAX_TURNS, (
+            f"did not complete within {FIXTURE_MAX_TURNS} turns: "
+            f"{len(scheduler.waiting)} waiting, {len(scheduler.running)} running"
+        )
+
+    events = scheduler.events
+    admits_b = _event_index(events, EventKind.ADMIT, "B")
+    preempts_b = _event_index(events, EventKind.PREEMPT, "B")
+    finishes_a = _event_index(events, EventKind.FINISH, "A")
+
+    print(f"\nrequired fixture: {turns} turns, "
+          f"{FIXTURE_NUM_BLOCKS} blocks of {FIXTURE_BLOCK_SIZE}")
+    for event in events:
+        print(f"  step {event.step}  {event.kind.value:<9} {event.request_id}  "
+              f"free={event.free_blocks} running={event.running} waiting={event.waiting}")
+
+    # B is preempted exactly once. The bound of one is a property of this
+    # fixture, not a cap the scheduler enforces.
+    assert len(preempts_b) == 1, f"expected exactly one preemption of B, got {len(preempts_b)}"
+    assert not _event_index(events, EventKind.PREEMPT, "A"), "A must never be preempted"
+    assert len(admits_b) == 2, f"expected admit + one readmit for B, got {len(admits_b)}"
+
+    preempt_b, finish_a, readmit_b = preempts_b[0], finishes_a[0], admits_b[1]
+    assert preempt_b < finish_a < readmit_b, (
+        f"ordering violated: PREEMPT(B)={preempt_b}, FINISH(A)={finish_a}, "
+        f"READMIT(B)={readmit_b}"
+    )
+    # No readmission of B in the window between losing its blocks and A's finish
+    # returning them: B genuinely waits rather than thrashing.
+    assert not [index for index in admits_b if preempt_b < index < finish_a], (
+        "B was readmitted before A finished"
+    )
+    # The readmission is a replay, not a fresh start.
+    recomputes_b = _event_index(events, EventKind.RECOMPUTE, "B")
+    assert len(recomputes_b) == 1
+    assert recomputes_b[0] > preempt_b
+
+    # All three blocks came back.
+    assert allocator.num_free == FIXTURE_NUM_BLOCKS
+    assert allocator.num_allocated == 0
+
+    assert scheduler.finished["A"].preemption_count == 0
+    assert scheduler.finished["B"].preemption_count == 1
+    assert len(scheduler.finished["A"].generated) == FIXTURE_MAX_NEW
+    assert len(scheduler.finished["B"].generated) == FIXTURE_MAX_NEW
+
+
+def test_required_fixture_recompute_is_byte_identical():
+    """B's output in the fixture equals B's output when never preempted."""
+    scheduler, _ = _stub_scheduler(
+        num_blocks=FIXTURE_NUM_BLOCKS, block_size=FIXTURE_BLOCK_SIZE
+    )
+    assert scheduler.add_request(_request("A", FIXTURE_PROMPT_LEN, FIXTURE_MAX_NEW))
+    assert scheduler.add_request(_request("B", FIXTURE_PROMPT_LEN, FIXTURE_MAX_NEW))
+    preempted = scheduler.run_to_completion()
+    assert scheduler.finished["B"].preemption_count == 1
+
+    alone, reference = _stub_scheduler(
+        num_blocks=RECOMPUTE_AMPLE_BLOCKS, block_size=FIXTURE_BLOCK_SIZE
+    )
+    assert alone.add_request(_request("B", FIXTURE_PROMPT_LEN, FIXTURE_MAX_NEW))
+    untouched = alone.run_to_completion()
+    assert alone.finished["B"].preemption_count == 0
+
+    assert preempted["B"] == untouched["B"], (
+        f"recompute changed the answer: preempted {preempted['B']} "
+        f"vs untouched {untouched['B']}"
+    )
+
+
+def test_one_preemption_is_fixture_specific_not_a_global_cap():
+    """The scheduler imposes no limit; the fixture's bound of one is its own."""
+    scheduler, _ = _stub_scheduler(num_blocks=GROWTH_POOL_BLOCKS)
+    for request in GROWTH_REQUESTS:
+        assert scheduler.add_request(request)
+    scheduler.run_to_completion()
+
+    counts = {rid: seq.preemption_count for rid, seq in scheduler.finished.items()}
+    print(f"\nno global cap: preemption counts {counts}")
+    assert max(counts.values()) > 1, (
+        "no request was preempted more than once, so this cannot distinguish "
+        "'no cap' from 'a cap of one'"
+    )
+
+
+def test_real_pool_exhaustion_completes_every_request():
+    """Exhaust the real configured pool: no deadlock, no loss, no truncation."""
+    from engine.cache import NUM_GPU_BLOCKS
+
+    requests = [
+        _request(f"x{index}", EXHAUSTION_PROMPT_LEN, EXHAUSTION_MAX_NEW)
+        for index in range(EXHAUSTION_REQUESTS)
+    ]
+    scheduler, allocator = _stub_scheduler(num_blocks=NUM_GPU_BLOCKS, block_size=BLOCK_SIZE)
+    assert allocator.num_blocks == NUM_GPU_BLOCKS
+    assert allocator.block_size == BLOCK_SIZE
+    for request in requests:
+        assert scheduler.add_request(request), "the guard should not reject these"
+
+    outputs = scheduler.run_to_completion()
+
+    demanded = sum(
+        allocator.blocks_needed(request.max_total_len) for request in requests
+    )
+    preempts = scheduler.events_of(EventKind.PREEMPT)
+    print(
+        f"\nreal pool {NUM_GPU_BLOCKS} blocks x {BLOCK_SIZE}: "
+        f"{EXHAUSTION_REQUESTS} requests demanding {demanded} blocks "
+        f"({demanded / NUM_GPU_BLOCKS:.1f}x the pool), "
+        f"{len(preempts)} preemptions, "
+        f"max running {max(event.running for event in scheduler.events)}"
+    )
+    assert demanded > NUM_GPU_BLOCKS, "the pool was never actually oversubscribed"
+    assert preempts, "exhaustion was not reached"
+
+    # No request lost.
+    assert set(outputs) == {request.request_id for request in requests}
+    # No silent truncation.
+    for request in requests:
+        assert len(outputs[request.request_id]) == request.max_new_tokens, (
+            f"{request.request_id} produced {len(outputs[request.request_id])} tokens, "
+            f"expected {request.max_new_tokens}"
+        )
+    # Correct output, against each request run alone.
+    sequential = _run_sequentially(requests, num_blocks=NUM_GPU_BLOCKS)
+    for request in requests:
+        assert outputs[request.request_id] == sequential[request.request_id], (
+            f"{request.request_id} diverged under exhaustion"
+        )
+    # Pool fully reclaimed.
+    assert allocator.num_free == NUM_GPU_BLOCKS
+    assert allocator.num_allocated == 0
+
+
+@pytest.mark.parametrize("prompt_len,pool_blocks", RECOMPUTE_CASES)
+def test_model_recompute_is_byte_identical(runtime, prompt_len, pool_blocks):
+    """THE Step 5 gate, on the real model.
+
+    A preempted-and-replayed request must produce exactly the tokens it produces
+    when it is never touched. This is the one place the numerics of recompute are
+    actually at risk: the replay re-derives the whole history in a single
+    multi-token prefill, where the untouched run built the same KV one token at a
+    time. Those are different reduction orders, so the KV is not bitwise equal,
+    and a token could flip. Only measurement settles it.
+    """
+    device, engine = runtime
+    torch.manual_seed(SEED)
+    ids = _base_ids()
+
+    b = Request(
+        request_id="B",
+        prompt_token_ids=tuple(ids[:prompt_len]),
+        max_new_tokens=RECOMPUTE_B_MAX_NEW,
+    )
+    filler = Request(
+        request_id="filler",
+        prompt_token_ids=tuple(ids[:RECOMPUTE_FILLER_PROMPT_LEN]),
+        max_new_tokens=RECOMPUTE_FILLER_MAX_NEW,
+    )
+
+    # Reference: B alone on an ample pool, never preempted.
+    reference_scheduler, _ = _model_scheduler(
+        engine, RECOMPUTE_AMPLE_BLOCKS, RECOMPUTE_BLOCK_SIZE
+    )
+    assert reference_scheduler.add_request(b)
+    untouched = reference_scheduler.run_to_completion()
+    assert reference_scheduler.finished["B"].preemption_count == 0
+
+    # Preempted: an older filler holds blocks while B tries to grow.
+    scheduler, allocator = _model_scheduler(engine, pool_blocks, RECOMPUTE_BLOCK_SIZE)
+    assert scheduler.add_request(filler)
+    assert scheduler.add_request(b)
+    preempted = scheduler.run_to_completion()
+
+    sequence = scheduler.finished["B"]
+    replay = [
+        event for event in scheduler.events_of(EventKind.RECOMPUTE)
+        if event.request_id == "B"
+    ]
+    print(
+        f"\n[{device}] recompute gate prompt_len={prompt_len} pool={pool_blocks} "
+        f"blocks of {RECOMPUTE_BLOCK_SIZE}"
+    )
+    print(f"[{device}]   B preemption_count : {sequence.preemption_count}")
+    print(f"[{device}]   replay             : {replay[0].detail if replay else 'none'}")
+    print(f"[{device}]   identical to untouched: {preempted['B'] == untouched['B']}")
+
+    assert sequence.preemption_count == 1, (
+        f"fixture did not preempt B exactly once (got {sequence.preemption_count}); "
+        "the gate would be vacuous"
+    )
+    assert replay, "B was readmitted without a recompute event"
+    assert allocator.num_free == pool_blocks
+
+    assert preempted["B"] == untouched["B"], (
+        f"[{device}] recompute changed the answer at prompt_len={prompt_len}: "
+        f"preempted {preempted['B']} vs untouched {untouched['B']}"
+    )
