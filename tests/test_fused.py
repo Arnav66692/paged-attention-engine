@@ -40,6 +40,7 @@ import torch
 
 from engine.attention import BatchInput, FusedPagedAttention, PagedBackend
 from engine.cache import (
+    ADMISSION_MARGIN_BLOCKS,
     BLOCK_SIZE,
     BlockAllocator,
     PagedCacheSpec,
@@ -132,6 +133,16 @@ RECOMPUTE_PROMPT_LEN = 33
 RECOMPUTE_MAX_NEW = 16
 RECOMPUTE_FILLER_PROMPT_LEN = 16
 RECOMPUTE_FILLER_MAX_NEW = 16
+
+# The thrashing fixture, shape-identical to the one tests/test_sched.py uses for
+# test_recompute_folds_into_the_same_batched_call. One of its steps readmits two
+# preempted sequences and evicts one of them again, all before the flush.
+CO_POOL_BLOCKS = 12
+CO_BLOCK_SIZE = 4
+CO_MARGIN = 0
+CO_REQUESTS = 5
+CO_PROMPT_LEN = 5
+CO_MAX_NEW = 24
 
 # Throughput fixture. Big enough that the measurement is the model rather than
 # the scheduler, small enough to belong in a test.
@@ -292,6 +303,7 @@ def _build(
     *,
     pool_blocks: int = FUSED_POOL_BLOCKS,
     block_size: int = BLOCK_SIZE,
+    margin: int = ADMISSION_MARGIN_BLOCKS,
     record_logits: bool = False,
     wrapper=InstrumentedExecutor,
 ):
@@ -299,7 +311,11 @@ def _build(
     cache = engine.new_paged_cache(pool_blocks, block_size)
     executor = wrapper(Qwen2Executor(engine, cache, allocator))
     scheduler = Scheduler(
-        executor, allocator, mode=mode, record_logits=record_logits
+        executor,
+        allocator,
+        admission_margin_blocks=margin,
+        mode=mode,
+        record_logits=record_logits,
     )
     return scheduler, executor, allocator, cache
 
@@ -879,6 +895,90 @@ def test_fused_model_makes_exactly_one_forward_pass_per_step(runtime):
         "fusion saved no forward passes at all, which cannot be right if any step "
         "ran more than one sequence"
     )
+
+
+def test_fused_model_makes_one_pass_per_step_under_preemption(runtime):
+    """One pass per step still, on a step that preempts AND replays at once.
+
+    A recompute re-prefills a whole history, which is a forward. The scheduler
+    routes it through `_submit` like any decode, so in fused mode it joins the
+    step's batch -- but that is a claim about the scheduler, and this checks the
+    consequence at the model, where `forward_pass_count` counts traversals of the
+    layer stack and cannot be satisfied by naming.
+
+    The fixture is the shape
+    `tests/test_sched.py::test_recompute_folds_into_the_same_batched_call` found:
+    twelve blocks of four, no margin, five requests that each grow to six blocks.
+    It thrashes, and one of its steps readmits two preempted sequences and then
+    evicts one of them again while planning the decodes. Same shape here, real
+    tokens, so the schedule is the same -- admission and eviction read token
+    counts, never token values.
+    """
+    device, engine = runtime
+    torch.manual_seed(SEED)
+    ids = _base_ids()
+
+    scheduler, _, allocator, _ = _build(
+        engine,
+        ExecutionMode.FUSED,
+        pool_blocks=CO_POOL_BLOCKS,
+        block_size=CO_BLOCK_SIZE,
+        margin=CO_MARGIN,
+    )
+    # Distinct slices, so the five requests are different sequences of the same
+    # length rather than five copies of one.
+    for index in range(CO_REQUESTS):
+        assert scheduler.add_request(
+            Request(
+                request_id=f"r{index}",
+                prompt_token_ids=tuple(ids[index : index + CO_PROMPT_LEN]),
+                max_new_tokens=CO_MAX_NEW,
+            )
+        )
+
+    observed: list[tuple[int, int]] = []
+    replay_steps: list[int] = []
+    preempt_steps: list[int] = []
+    both_steps: list[int] = []
+    while scheduler.waiting or scheduler.running:
+        before_passes = engine.forward_pass_count
+        before_events = len(scheduler.events)
+        result = scheduler.step()
+        raised = [event.kind for event in scheduler.events[before_events:]]
+        if EventKind.RECOMPUTE in raised:
+            replay_steps.append(result.step)
+        if EventKind.PREEMPT in raised:
+            preempt_steps.append(result.step)
+        if EventKind.RECOMPUTE in raised and EventKind.PREEMPT in raised:
+            both_steps.append(result.step)
+        observed.append((result.batch_size, engine.forward_pass_count - before_passes))
+        assert result.step < 400, "fixture did not converge"
+
+    print(f"\n[{device}] thrashing fixture: {len(observed)} steps, "
+          f"preempt on {preempt_steps}, recompute on {replay_steps}")
+    print(f"[{device}] steps with BOTH: {both_steps}")
+    for step in both_steps:
+        width, passes = observed[step - 1]
+        print(f"[{device}]   step {step}: width={width}, forward passes={passes}")
+
+    assert preempt_steps, "the pool was not tight enough to preempt"
+    assert replay_steps, "nothing was ever replayed, so the question is untested"
+    assert both_steps, (
+        "no step contained both a preempt and a recompute, so this fixture "
+        "cannot answer the question it exists to answer"
+    )
+    _assert_one_pass_per_step(observed)
+
+    # The co-occurrence step must carry a replay prefill *alongside* other work,
+    # or "it folded in" would be a claim about a batch of one.
+    for step in both_steps:
+        width, passes = observed[step - 1]
+        assert passes == 1, f"step {step} cost {passes} passes"
+        assert width >= 2, (
+            f"step {step} batched only {width} sequence, so the replay did not "
+            "actually share a call with anything"
+        )
+    assert allocator.num_free == CO_POOL_BLOCKS
 
 
 def test_unfused_makes_one_forward_pass_per_sequence(runtime):

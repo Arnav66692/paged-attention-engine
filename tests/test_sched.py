@@ -1018,3 +1018,172 @@ def test_fused_defers_mid_step_reclamation():
     for pool in (unfused_pool, fused_pool):
         assert pool.num_free == RECLAIM_NUM_BLOCKS
         assert pool.num_allocated == 0
+
+
+# --- Step 5b, the question the fusion report left open ----------------------
+#
+# Does one-pass-per-step survive a step where a preemption AND a recompute both
+# happen? A recompute re-prefills the whole history, which is a forward, so the
+# question is whether that forward joins the step's batch or costs its own call.
+#
+# ANSWER: it joins. A readmission goes through `_start`, which calls `_submit`
+# like any decode, so in FUSED mode it lands in `_pending` and is flushed with
+# everything else. There is no path by which a recompute issues its own forward.
+# Asserted below on a fixture where both events land in one step, rather than
+# argued from the source.
+
+# Twelve blocks of four, no margin, five requests that each grow to six blocks.
+# Step 29 of this run readmits two preempted sequences -- two recomputes -- and
+# then evicts one of them again while planning the decodes, all in one step.
+CO_NUM_BLOCKS = 12
+CO_BLOCK_SIZE = 4
+CO_MARGIN = 0
+CO_REQUESTS = 5
+CO_PROMPT_LEN = 5
+CO_MAX_NEW = 24
+
+
+def _co_requests():
+    return [_request(f"r{index}", CO_PROMPT_LEN, CO_MAX_NEW) for index in range(CO_REQUESTS)]
+
+
+def _run_co_fixture(mode: ExecutionMode):
+    """Step through the fixture, recording per-step calls and the events raised."""
+    scheduler, allocator = _stub_scheduler(
+        num_blocks=CO_NUM_BLOCKS, margin=CO_MARGIN, block_size=CO_BLOCK_SIZE, mode=mode
+    )
+    for request in _co_requests():
+        assert scheduler.add_request(request), "the guard should not reject these"
+
+    executor = scheduler.executor
+    rows = []
+    while scheduler.waiting or scheduler.running:
+        calls_before = executor.calls
+        events_before = len(scheduler.events)
+        result = scheduler.step()
+        rows.append(
+            (
+                result.step,
+                result.batch_size,
+                executor.calls - calls_before,
+                tuple((e.kind, e.request_id) for e in scheduler.events[events_before:]),
+            )
+        )
+        assert result.step < 400, "fixture did not converge"
+    return scheduler, allocator, rows
+
+
+def _steps_with(rows, *kinds):
+    return [row for row in rows if all(any(k is kind for k, _ in row[3]) for kind in kinds)]
+
+
+def test_recompute_folds_into_the_same_batched_call():
+    """A step containing BOTH a preempt and a recompute still costs ONE call.
+
+    The step this pins does more than the name suggests. It readmits two
+    preempted sequences, so two recompute prefills are planned, and then evicts
+    one of them *again* while planning the decodes -- so the batch also loses a
+    member it had already reserved blocks for. One call covers all of it.
+    """
+    scheduler, allocator, rows = _run_co_fixture(ExecutionMode.FUSED)
+    executor = scheduler.executor
+
+    both = _steps_with(rows, EventKind.PREEMPT, EventKind.RECOMPUTE)
+    print(f"\nfused: {len(rows)} steps, {len(both)} with both a preempt and a recompute")
+    for step, width, calls, events in both:
+        print(f"  step {step}  width={width}  calls={calls}")
+        for kind, request_id in events:
+            print(f"      {kind.value:<9} {request_id}")
+
+    assert both, (
+        "no step contained both a preempt and a recompute, so this fixture "
+        "cannot answer the question it exists to answer"
+    )
+    for step, width, calls, events in both:
+        assert calls == 1, (
+            f"step {step} raised {[k.value for k, _ in events]} and made {calls} "
+            "calls; a recompute must join the step's batch, not run beside it"
+        )
+        assert width >= 1
+
+    # Not just on those steps: one call per step for the whole run, and the
+    # recompute prefills are genuinely inside those batches rather than skipped.
+    assert all(calls == 1 for _, _, calls, _ in rows)
+    assert executor.forward_calls == 0, "fused mode fell back to single forwards"
+    assert executor.batch_calls == len(rows)
+
+    recomputes = scheduler.events_of(EventKind.RECOMPUTE)
+    preempts = scheduler.events_of(EventKind.PREEMPT)
+    print(f"fused: {len(preempts)} preemptions and {len(recomputes)} recomputes "
+          f"across {len(rows)} steps, {executor.batch_calls} batched calls, "
+          f"0 single calls")
+    assert len(recomputes) >= 2
+    assert allocator.num_free == CO_NUM_BLOCKS
+
+
+def test_the_co_occurrence_fixture_costs_several_calls_unfused():
+    """Calibration: the same step is several calls in the reference mode.
+
+    Without this, `calls == 1` above could be a property of the fixture rather
+    than of fusion.
+    """
+    scheduler, _, rows = _run_co_fixture(ExecutionMode.UNFUSED)
+    both = _steps_with(rows, EventKind.PREEMPT, EventKind.RECOMPUTE)
+
+    print(f"\nunfused: {len(rows)} steps, {len(both)} with both")
+    for step, width, calls, _ in both:
+        print(f"  step {step}  width={width}  calls={calls}")
+
+    assert both
+    assert any(calls > 1 for _, _, calls, _ in both), (
+        "the co-occurrence step was a single call even unfused, so the fused "
+        "result proves nothing"
+    )
+    assert max(calls for _, _, calls, _ in rows) > 1
+    assert scheduler.executor.batch_calls == 0
+
+
+def test_fused_and_unfused_agree_on_the_co_occurrence_fixture():
+    """Same tokens out of a run that preempts one request twice."""
+    fused, _, _ = _run_co_fixture(ExecutionMode.FUSED)
+    unfused, _, _ = _run_co_fixture(ExecutionMode.UNFUSED)
+
+    fused_out = {rid: tuple(seq.generated) for rid, seq in fused.finished.items()}
+    unfused_out = {rid: tuple(seq.generated) for rid, seq in unfused.finished.items()}
+    counts = {rid: seq.preemption_count for rid, seq in sorted(fused.finished.items())}
+
+    print(f"\nco-occurrence fixture preemption counts: {counts}")
+    assert fused_out == unfused_out
+    assert all(len(tokens) == CO_MAX_NEW for tokens in fused_out.values())
+    # Somebody was preempted more than once, so the fixture really is thrashing.
+    assert max(counts.values()) > 1
+
+
+def test_a_step_that_evicts_everything_it_planned_makes_no_call():
+    """The other edge of the invariant: at most one call, not exactly one.
+
+    If every planned sequence is evicted before the flush, `_pending` is empty
+    and the step issues no forward at all. No fixture in this file reaches that
+    state, so it is provoked directly -- an invariant with an unreachable branch
+    is still an invariant, and leaving it unpinned would mean `calls == 1`
+    silently became `calls == 0` one day.
+    """
+    scheduler, _ = _stub_scheduler(num_blocks=8, mode=ExecutionMode.FUSED)
+    assert scheduler.add_request(_request("only", 16, 4))
+    scheduler.step()
+
+    executor = scheduler.executor
+    calls_before = executor.calls
+    # Plan the step, then take the planned work away before it can be flushed.
+    scheduler._step += 1
+    scheduler._pending = []
+    scheduler._ran = []
+    scheduler._plan_decode(scheduler.running[0])
+    assert scheduler._pending, "nothing was planned, so there is nothing to drop"
+    scheduler._evict(scheduler.running[0])
+    assert not scheduler._pending, "eviction did not drop the planned work"
+    scheduler._flush()
+
+    print(f"\nempty batch: {executor.calls - calls_before} calls issued")
+    assert executor.calls == calls_before, "an empty batch still issued a forward"
+    assert not scheduler._ran
