@@ -70,6 +70,27 @@ from engine.attention import AttentionBackend, BatchInput
 from engine.cache import ADMISSION_MARGIN_BLOCKS, AllocResult, BlockAllocator
 
 
+def admission_limit_blocks(num_blocks: int, admission_margin_blocks: int) -> int:
+    """The most blocks any single request may ever be allowed to hold."""
+    return num_blocks - admission_margin_blocks
+
+
+def is_admissible(
+    max_total_len: int,
+    allocator: BlockAllocator,
+    admission_margin_blocks: int = ADMISSION_MARGIN_BLOCKS,
+) -> bool:
+    """THE admission guard, as a predicate anything can ask.
+
+    Module-level rather than a method because `bench/baseline.py` has to reject
+    exactly what the scheduler rejects, and the only way to make "identically"
+    literally true is for both to call this. `Scheduler.add_request` does.
+    """
+    return allocator.blocks_needed(max_total_len) <= admission_limit_blocks(
+        allocator.num_blocks, admission_margin_blocks
+    )
+
+
 class EventKind(Enum):
     ADMIT = "admit"
     FINISH = "finish"
@@ -319,7 +340,9 @@ class Scheduler:
     @property
     def max_admissible_blocks(self) -> int:
         """The largest a request may ever become and still be accepted."""
-        return self.allocator.num_blocks - self.admission_margin_blocks
+        return admission_limit_blocks(
+            self.allocator.num_blocks, self.admission_margin_blocks
+        )
 
     def _admission_fits(self, seq: Sequence) -> bool:
         """Room for the complete current history, keeping the margin free."""
@@ -364,7 +387,9 @@ class Scheduler:
         self._next_arrival += 1
 
         required = self.allocator.blocks_needed(request.max_total_len)
-        if required > self.max_admissible_blocks:
+        if not is_admissible(
+            request.max_total_len, self.allocator, self.admission_margin_blocks
+        ):
             seq.status = SequenceStatus.REJECTED
             self.rejected[request.request_id] = seq
             self._log(

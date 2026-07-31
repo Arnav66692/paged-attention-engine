@@ -19,5 +19,9 @@ tokenizers==0.22.2
 accelerate==1.14.0
 numpy==2.5.0
 
+# Plotting only, and imported lazily inside bench/plot.py. A host that runs the
+# sweep but not the plots does not need it, and nothing in engine/ imports it.
+matplotlib==3.11.1
+
 # Test only.
 pytest==9.1.1
