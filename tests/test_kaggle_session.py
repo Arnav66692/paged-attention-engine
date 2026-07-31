@@ -266,7 +266,20 @@ def _slugify(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
 
 
-@pytest.mark.parametrize("session", ("preflight", "session0"))
+def _kernel_dirs():
+    """Every kernel in kaggle/, discovered rather than listed.
+
+    A hand-maintained list would not have covered session1, and the 409 this
+    guards against costs a push and a diagnosis each time.
+    """
+    if not KAGGLE_DIR.exists():
+        return []
+    return sorted(
+        path.parent.name for path in KAGGLE_DIR.glob("*/kernel-metadata.json")
+    )
+
+
+@pytest.mark.parametrize("session", _kernel_dirs() or ["<none>"])
 @needs_kaggle_dir
 def test_kernel_id_matches_the_slug_kaggle_will_derive(session):
     """The id must equal slugify(title), or the push 409s.
