@@ -9,3 +9,12 @@ kaggle/_build/
 kaggle/_output/
 bench/results/
 bench/plots/
+
+# Kaggle API credentials. The real token lives at ~/.kaggle/kaggle.json, outside
+# this repo, so these patterns exist to catch a stray copy landing inside it. A
+# leaked token is an account takeover, so the guard is belt and braces:
+# tests/test_kaggle_session.py asserts git tracks no credential file.
+kaggle.json
+.kaggle/
+**/kaggle.json
+*credentials*.json

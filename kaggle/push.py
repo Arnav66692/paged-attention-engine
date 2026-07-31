@@ -49,6 +49,7 @@ REPO_EXCLUDE = shutil.ignore_patterns(
 
 POLL_SECONDS = 30
 POLL_TIMEOUT_SECONDS = 12 * 3600  # Kaggle's own kernel ceiling
+DATASET_READY_TIMEOUT_SECONDS = 600
 
 
 class Blocked(RuntimeError):
@@ -128,7 +129,14 @@ def stage(username: str, session: str) -> tuple[Path, Path]:
 
 
 def push_dataset(dataset_dir: Path, username: str) -> None:
-    """Create the dataset, or add a version if it already exists."""
+    """Create the dataset, or add a version if it already exists, then WAIT.
+
+    Waiting matters. A dataset is not attachable the instant `create` returns --
+    Kaggle still has to process and unpack it. The first preflight run pushed a
+    kernel ten seconds after creating the dataset and the kernel saw an empty
+    /kaggle/input, which looked exactly like a broken transport and was not.
+    Poll the real status instead of sleeping a guess.
+    """
     existing = kaggle("datasets", "list", "--mine", "-s", "paged-attention-repo",
                       check=False)
     slug = f"{username}/paged-attention-repo"
@@ -137,8 +145,22 @@ def push_dataset(dataset_dir: Path, username: str) -> None:
                "-m", "repo sync", "--dir-mode", "zip")
     else:
         kaggle("datasets", "create", "-p", str(dataset_dir), "--dir-mode", "zip")
-    # Kaggle needs a moment before a new version is attachable.
-    time.sleep(10)
+
+    deadline = time.perf_counter() + DATASET_READY_TIMEOUT_SECONDS
+    while time.perf_counter() < deadline:
+        status = kaggle("datasets", "status", slug, check=False)
+        text = ((status.stdout or "") + (status.stderr or "")).strip().lower()
+        if "ready" in text:
+            print("dataset ready")
+            return
+        if "error" in text:
+            raise RuntimeError(f"dataset processing failed: {text}")
+        print(f"  dataset status: {text or '(pending)'}", flush=True)
+        time.sleep(10)
+    raise RuntimeError(
+        f"dataset {slug} was not ready within {DATASET_READY_TIMEOUT_SECONDS}s; "
+        "pushing a kernel now would give it an empty /kaggle/input"
+    )
 
 
 def push_kernel(kernel_dir: Path) -> None:

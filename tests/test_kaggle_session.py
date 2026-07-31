@@ -171,3 +171,55 @@ def test_session0_runs_end_to_end_against_a_fake_mount(tmp_path):
     # And the GPU-only parts must have been recorded as failures, not crashed.
     assert "nvidia-smi" in steps
     assert report["environment"]["cuda_available"] is False
+
+
+# --- credential hygiene -----------------------------------------------------
+
+
+CREDENTIAL_PATHS = (
+    "kaggle.json",
+    "kaggle/kaggle.json",
+    ".kaggle/kaggle.json",
+    "some/deep/path/kaggle.json",
+    "my_credentials.json",
+)
+
+
+def test_git_tracks_no_kaggle_credential():
+    """A tracked API token is an account takeover. Checked, not assumed.
+
+    The real token lives at ~/.kaggle/kaggle.json, outside this repo, so this
+    cannot fail today -- which is exactly why it is worth asserting. It fails the
+    day someone copies one in "just to test something".
+    """
+    tracked = subprocess.run(
+        ["git", "ls-files"], cwd=REPO_ROOT, capture_output=True, text=True, timeout=60,
+    )
+    assert tracked.returncode == 0, tracked.stderr
+    offenders = [
+        line for line in tracked.stdout.splitlines()
+        if "kaggle.json" in line.lower() or line.startswith(".kaggle/")
+    ]
+    assert not offenders, f"git is tracking credential file(s): {offenders}"
+
+
+@pytest.mark.parametrize("path", CREDENTIAL_PATHS)
+def test_gitignore_would_catch_a_stray_credential(path):
+    """Every plausible place a token could land must already be ignored."""
+    result = subprocess.run(
+        ["git", "check-ignore", "-q", path],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, (
+        f"{path} is NOT gitignored, so a token dropped there could be committed"
+    )
+
+
+def test_the_repo_tree_holds_no_credential_file():
+    """Nothing that looks like a token is sitting in the working tree either."""
+    found = [
+        path.relative_to(REPO_ROOT)
+        for path in REPO_ROOT.rglob("kaggle*.json")
+        if ".venv" not in path.parts and ".git" not in path.parts
+    ]
+    assert not found, f"credential-shaped file(s) in the repo tree: {found}"

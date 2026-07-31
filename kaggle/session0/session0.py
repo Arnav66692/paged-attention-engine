@@ -209,15 +209,17 @@ section("REPO -- copied out of the read-only input mount")
 candidates = sorted(INPUT_ROOT.glob("*")) if INPUT_ROOT.exists() else []
 print(f"{INPUT_ROOT} contains: {[str(path) for path in candidates]}", flush=True)
 
+# Find the repo by the file that identifies it, not by a path shape. The mount
+# layout is NOT the documented /kaggle/input/<slug>/ -- the preflight found it at
+# /kaggle/input/datasets/<username>/<slug>/, three levels down. An earlier
+# version of this checked one and two levels and would have reported the repo
+# missing on a host where it was present the whole time.
 source = None
-for candidate in candidates:
-    if (candidate / "engine" / "scheduler.py").exists():
-        source = candidate
-        break
-    nested = candidate / "repo"
-    if (nested / "engine" / "scheduler.py").exists():
-        source = nested
-        break
+if INPUT_ROOT.exists():
+    for marker in INPUT_ROOT.rglob("scheduler.py"):
+        if marker.parent.name == "engine":
+            source = marker.parent.parent
+            break
 
 if source is None:
     record("repo_located", False,
