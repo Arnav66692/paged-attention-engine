@@ -3,8 +3,16 @@
 Gate 1, Step 6.
 
   throughput_vs_concurrency   Both engines on one axis. This is the claim.
-  memory_fragmentation        Where the KV bytes actually went, which is the
-                              explanation for the first plot.
+  memory_fragmentation        ANALYTICAL. Where the KV bytes go under the frozen
+                              workload's length distribution. Explains why the
+                              first plot looks the way it does, and would read
+                              the same on any host -- which is its strength and
+                              its limit: it proves nothing about a given run.
+  measured_fragmentation      MEASURED. Capacity against occupancy over one real
+                              run, read off the scheduler's event log, which
+                              records free_blocks and tokens_held at every
+                              admit, finish, preempt and recompute. Analytical
+                              explains why; this proves it happened.
 
 Everything drawn here comes out of the JSON `bench/run.py` wrote. Nothing is
 recomputed, nothing is inferred, and nothing is drawn that the file does not
@@ -120,7 +128,13 @@ def throughput_vs_concurrency(payload: dict, out_path: Path):
     axes.set_ylabel("throughput (tokens/second, median of measured passes)")
     axes.set_title("Gate 1: throughput against concurrency")
     axes.grid(alpha=0.3)
-    axes.legend(loc="best")
+    if axes.get_legend_handles_labels()[0]:
+        axes.legend(loc="best")
+    else:
+        # Every level was UNRESOLVED or the run recorded no throughput. Say so on
+        # the axes rather than shipping an empty frame that looks like zero.
+        axes.text(0.5, 0.6, "no level yielded a reportable median",
+                  transform=axes.transAxes, ha="center", va="center", fontsize=12)
 
     banner = _invalid_banner(payload)
     if banner:
@@ -278,6 +292,145 @@ def memory_fragmentation(payload: dict, out_path: Path):
     return out_path
 
 
+@dataclass(frozen=True)
+class MeasuredOccupancy:
+    """What a run's event log says about capacity against occupancy.
+
+    The analytical split above is a property of the length distribution and would
+    read the same on any host, which is its strength and its limit: it explains
+    why paging should win and proves nothing about whether it did. This comes off
+    the scheduler's own event log, which records `free_blocks` and `tokens_held`
+    at every admit, finish, preempt and recompute -- capacity and occupancy,
+    sampled at every decision the scheduler made.
+    """
+
+    steps: tuple[int, ...]
+    reserved_slots: tuple[int, ...]
+    held_tokens: tuple[int, ...]
+    preempt_steps: tuple[int, ...]
+    recompute_steps: tuple[int, ...]
+    block_size: int
+    pool_slots: int
+
+    @property
+    def mean_occupancy(self) -> float:
+        """Mean held/reserved over the run. The measured counterpart of `held`."""
+        pairs = [
+            (held, reserved)
+            for held, reserved in zip(self.held_tokens, self.reserved_slots)
+            if reserved > 0
+        ]
+        if not pairs:
+            return 0.0
+        return sum(held / reserved for held, reserved in pairs) / len(pairs)
+
+    @property
+    def peak_reserved_slots(self) -> int:
+        return max(self.reserved_slots, default=0)
+
+
+def measured_occupancy(payload: dict, engine: str = "engine") -> MeasuredOccupancy | None:
+    """Read the pool trace out of a results file. None if the run recorded none."""
+    provenance = payload.get("provenance", {})
+    block_size = provenance.get("block_size", BLOCK_SIZE)
+    num_blocks = provenance.get("num_gpu_blocks", NUM_GPU_BLOCKS)
+
+    trace: list = []
+    for level in _levels_for(payload, engine):
+        if level.get("pool_trace"):
+            trace = level["pool_trace"]
+    if not trace:
+        return None
+
+    steps, reserved, held = [], [], []
+    preempts, recomputes = [], []
+    for step, blocks_allocated, tokens_held, kind in trace:
+        steps.append(step)
+        reserved.append(blocks_allocated * block_size)
+        held.append(tokens_held)
+        if kind == "preempt":
+            preempts.append(step)
+        elif kind == "recompute":
+            recomputes.append(step)
+
+    return MeasuredOccupancy(
+        steps=tuple(steps),
+        reserved_slots=tuple(reserved),
+        held_tokens=tuple(held),
+        preempt_steps=tuple(preempts),
+        recompute_steps=tuple(recomputes),
+        block_size=block_size,
+        pool_slots=num_blocks * block_size,
+    )
+
+
+def measured_fragmentation(payload: dict, out_path: Path):
+    """Capacity against occupancy over the run. The measured plot.
+
+    Two curves and the gap between them. `reserved` is what the pool handed out,
+    in token slots; `held` is how many of those slots have a token in them. The
+    shaded gap is internal fragmentation as it actually occurred, rather than as
+    the length distribution predicts it should.
+
+    Preemptions and recomputes are marked on the same axis, because they are what
+    the gap costs: every eviction is capacity that was reserved, filled, and then
+    given back, and every recompute is the work of refilling it.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    observed = measured_occupancy(payload)
+    figure, axes = plt.subplots(figsize=(11, 5.5))
+
+    if observed is None:
+        axes.text(0.5, 0.5, "no pool trace recorded in this run",
+                  transform=axes.transAxes, ha="center", va="center", fontsize=14)
+    else:
+        # Step, not line. The event log samples pool state at each decision and
+        # the state holds until the next one, so interpolating between samples
+        # would draw a ramp where the pool actually sat still.
+        axes.plot(observed.steps, observed.reserved_slots, drawstyle="steps-post",
+                  label=f"reserved (blocks handed out x {observed.block_size})",
+                  linewidth=1.8, color="#f08c2e")
+        axes.plot(observed.steps, observed.held_tokens, drawstyle="steps-post",
+                  label="held (tokens actually stored)", linewidth=1.8, color="#2b7bba")
+        axes.fill_between(observed.steps, observed.held_tokens, observed.reserved_slots,
+                          step="post", alpha=0.25, color="#f08c2e",
+                          label="internal fragmentation")
+        axes.axhline(observed.pool_slots, color="crimson", linestyle="--",
+                     linewidth=1.2, label=f"pool = {observed.pool_slots:,} slots")
+        for step in observed.preempt_steps:
+            axes.axvline(step, color="crimson", alpha=0.18, linewidth=1.0)
+        for step in observed.recompute_steps:
+            axes.axvline(step, color="seagreen", alpha=0.18, linewidth=1.0)
+
+        axes.set_title(
+            "Measured: capacity against occupancy over the run\n"
+            f"mean occupancy {observed.mean_occupancy:.1%}, "
+            f"{len(observed.preempt_steps)} preemptions (red), "
+            f"{len(observed.recompute_steps)} recomputes (green)",
+            fontsize=10,
+        )
+        axes.set_xlabel("scheduler step")
+        axes.set_ylabel("token slots")
+        axes.legend(loc="best", fontsize=8)
+        axes.grid(alpha=0.3)
+
+    banner = _invalid_banner(payload)
+    if banner:
+        axes.text(0.5, 0.5, banner, transform=axes.transAxes, ha="center",
+                  va="center", fontsize=15, color="crimson", alpha=0.35,
+                  rotation=18, weight="bold")
+    figure.text(0.01, 0.01, _provenance_line(payload), fontsize=6, alpha=0.75)
+    figure.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(out_path, dpi=150)
+    plt.close(figure)
+    return out_path
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Draw the Gate 1 plots.")
     parser.add_argument("results", type=Path)
@@ -291,6 +444,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     for path in (
         throughput_vs_concurrency(payload, args.out_dir / "throughput_vs_concurrency.png"),
         memory_fragmentation(payload, args.out_dir / "memory_fragmentation.png"),
+        measured_fragmentation(payload, args.out_dir / "measured_fragmentation.png"),
     ):
         print(f"wrote {path}")
     return 0

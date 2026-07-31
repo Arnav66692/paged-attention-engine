@@ -3,3 +3,9 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 out/
+
+# Kaggle staging and fetched outputs. Rebuilt by kaggle/push.py; never committed.
+kaggle/_build/
+kaggle/_output/
+bench/results/
+bench/plots/

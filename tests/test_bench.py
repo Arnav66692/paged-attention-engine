@@ -23,12 +23,12 @@ import pytest
 import torch
 
 from bench import baseline as baseline_mod
-from bench import plot as plot_mod
 from bench import run as run_mod
 from bench import workload
 from bench.workload import BLOCK_SIZE, NUM_GPU_BLOCKS, PRESSURE_C
 from engine.cache import ADMISSION_MARGIN_BLOCKS, BlockAllocator
 from engine.scheduler import ExecutionMode, is_admissible
+from tests.tiny_model import tiny_engine
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -413,7 +413,7 @@ def test_sweep_runs_end_to_end_on_the_stub_scale(tmp_path):
     the record it writes is stamped `throughput_valid: false`, and this test
     asserts that rather than asserting anything about how long it took.
     """
-    from engine.model import ModelDims, Qwen2Engine
+    from engine.model import ModelDims
 
     torch.manual_seed(0)
     # A tiny model with the real forward pass. Enough to exercise the engine path
@@ -422,7 +422,7 @@ def test_sweep_runs_end_to_end_on_the_stub_scale(tmp_path):
         num_layers=2, num_heads=4, num_kv_heads=2, head_dim=8, hidden_size=32,
         rms_norm_eps=1e-6, vocab_size=64, rope_theta=10000.0,
     )
-    engine = _tiny_engine(dims)
+    engine = tiny_engine(dims)
     pool_blocks = 32
 
     def cache_factory(allocator):
@@ -475,38 +475,6 @@ def test_sweep_runs_end_to_end_on_the_stub_scale(tmp_path):
     assert payload["levels"][0]["median_tokens_per_second"] is None
 
 
-def _tiny_engine(dims):
-    from engine.model import LayerWeights, Qwen2Engine, Qwen2Weights
-
-    def randn(*shape):
-        return torch.randn(*shape) * 0.02
-
-    layers = tuple(
-        LayerWeights(
-            q_proj_weight=randn(dims.num_heads * dims.head_dim, dims.hidden_size),
-            q_proj_bias=torch.zeros(dims.num_heads * dims.head_dim),
-            k_proj_weight=randn(dims.num_kv_heads * dims.head_dim, dims.hidden_size),
-            k_proj_bias=torch.zeros(dims.num_kv_heads * dims.head_dim),
-            v_proj_weight=randn(dims.num_kv_heads * dims.head_dim, dims.hidden_size),
-            v_proj_bias=torch.zeros(dims.num_kv_heads * dims.head_dim),
-            o_proj_weight=randn(dims.hidden_size, dims.num_heads * dims.head_dim),
-            gate_proj_weight=randn(64, dims.hidden_size),
-            up_proj_weight=randn(64, dims.hidden_size),
-            down_proj_weight=randn(dims.hidden_size, 64),
-            input_layernorm_weight=torch.ones(dims.hidden_size),
-            post_attention_layernorm_weight=torch.ones(dims.hidden_size),
-        )
-        for _ in range(dims.num_layers)
-    )
-    weights = Qwen2Weights(
-        embed_tokens=randn(dims.vocab_size, dims.hidden_size),
-        layers=layers,
-        final_norm_weight=torch.ones(dims.hidden_size),
-        lm_head_weight=randn(dims.vocab_size, dims.hidden_size),
-    )
-    return Qwen2Engine(weights, dims, torch.device("cpu"), torch.float32)
-
-
 def _tiny_stream(vocab: int):
     return tuple(
         workload.Request(
@@ -519,86 +487,6 @@ def _tiny_stream(vocab: int):
 
 
 # --- plots ------------------------------------------------------------------
-
-
-def _smoke_payload():
-    return {
-        "smoke": True,
-        "throughput_valid": False,
-        "provenance": {
-            "kv_pool_bytes": KV_POOL_BYTES,
-            "bytes_per_token": baseline_mod.BYTES_PER_TOKEN,
-            "num_gpu_blocks": NUM_GPU_BLOCKS,
-            "block_size": BLOCK_SIZE,
-            "gpu_name": None,
-            "driver_version": None,
-            "torch_version": torch.__version__,
-            "dtype": "torch.float32",
-            "model_sha": None,
-            "workload_digest": "smoke",
-            "cuda_available": False,
-        },
-        "levels": [
-            {"engine": "engine", "stream": "control", "concurrency": 16,
-             "median_tokens_per_second": 100.0, "median_seconds": 10.0,
-             "range_seconds": 0.5, "spread_fraction": 0.05, "generated_tokens": 1000,
-             "unresolved": False, "demanded_blocks": 1024, "peak_blocks_used": 900,
-             "preemption_count": 0},
-            {"engine": "engine", "stream": "control", "concurrency": 64,
-             "median_tokens_per_second": None, "median_seconds": 40.0,
-             "range_seconds": 12.0, "spread_fraction": 0.30, "generated_tokens": 4000,
-             "unresolved": True, "demanded_blocks": 4096, "peak_blocks_used": 3584,
-             "preemption_count": 41},
-            {"engine": "baseline", "stream": "control", "concurrency": 16,
-             "median_tokens_per_second": 40.0, "median_seconds": 25.0,
-             "range_seconds": 1.0, "spread_fraction": 0.04, "generated_tokens": 1000,
-             "unresolved": False, "demanded_blocks": 1024, "peak_blocks_used": 0,
-             "preemption_count": 0},
-        ],
-    }
-
-
-def test_an_invalid_run_is_labelled_inside_the_plot_not_in_a_caption():
-    payload = _smoke_payload()
-    banner = plot_mod._invalid_banner(payload)
-    print(f"\nbanner for a smoke run: {banner!r}")
-    assert banner and "SMOKE" in banner
-
-    valid = _smoke_payload()
-    valid["smoke"] = False
-    valid["throughput_valid"] = True
-    valid["provenance"]["cuda_available"] = True
-    assert plot_mod._invalid_banner(valid) is None
-
-
-def test_plots_render_from_a_results_file(tmp_path):
-    pytest.importorskip("matplotlib", reason="plotting is optional on this host")
-    payload = _smoke_payload()
-
-    throughput = plot_mod.throughput_vs_concurrency(
-        payload, tmp_path / "throughput.png"
-    )
-    fragmentation = plot_mod.memory_fragmentation(
-        payload, tmp_path / "fragmentation.png"
-    )
-    print(f"\nrendered {throughput.name} ({throughput.stat().st_size} bytes) and "
-          f"{fragmentation.name} ({fragmentation.stat().st_size} bytes)")
-
-    assert throughput.exists() and throughput.stat().st_size > 0
-    assert fragmentation.exists() and fragmentation.stat().st_size > 0
-
-
-def test_the_plot_draws_no_point_for_an_unresolved_level():
-    """UNRESOLVED means no median exists, so there is nothing to plot for it."""
-    payload = _smoke_payload()
-    engine_levels = [lv for lv in payload["levels"] if lv["engine"] == "engine"]
-    resolved = [lv for lv in engine_levels if lv["median_tokens_per_second"] is not None]
-    unresolved = [lv for lv in engine_levels if lv["unresolved"]]
-
-    assert unresolved, "the fixture must contain an unresolved level"
-    assert all(lv["median_tokens_per_second"] is None for lv in unresolved)
-    assert all(lv["concurrency"] not in {u["concurrency"] for u in unresolved}
-               for lv in resolved)
 
 
 def test_bench_workload_is_still_frozen():
@@ -637,49 +525,6 @@ def test_bench_workload_has_no_uncommitted_edit():
     )
 
 
-def test_the_fragmentation_split_is_the_argument_for_paging():
-    """The left panel's numbers, asserted rather than only drawn.
-
-    A plot is the easiest artefact to get subtly wrong and the hardest to notice
-    it in, so the quantity it claims is checked here. The claim is that at the
-    workload's own mean request length, a rectangle sized for the longest request
-    spends most of its slots on padding and a 16-token block spends almost none.
-    """
-    budgets = plot_mod.slot_budgets(baseline_mod.KV_POOL_TOKEN_SLOTS)
-    by_label = {budget.label.split("\n")[0]: budget for budget in budgets}
-
-    print()
-    for budget in budgets:
-        flat = budget.label.replace("\n", " ")
-        print(f"  {flat:<44} held {budget.held:6.1%}  "
-              f"padding {budget.padding:6.1%}  stranded {budget.stranded:6.1%}")
-
-    assert len(budgets) == len(baseline_mod.RECTANGLE_SIZINGS) + 1
-    for budget in budgets:
-        # Enforced by SlotBudget.__post_init__, restated so the intent is visible.
-        assert budget.held + budget.padding + budget.stranded == pytest.approx(1.0)
-        assert 0.0 <= budget.held <= 1.0
-
-    engine = by_label["paged engine"]
-    wide, narrow = budgets[0], budgets[1]
-
-    # The engine holds nearly everything and strands nothing.
-    assert engine.stranded == 0.0
-    assert engine.held > 0.95, (
-        f"the paged engine only holds {engine.held:.1%} of its slots, which would "
-        "mean 16-token blocks fragment nearly as badly as a rectangle"
-    )
-    # Both rectangles are mostly padding, and the wider one is worse.
-    assert wide.padding > 0.5
-    assert wide.held < narrow.held < engine.held, (
-        "the sizings are not ordered as the argument requires: a rectangle sized "
-        "for the distribution maximum must waste more than the P95, which must "
-        "waste more than a 16-token block"
-    )
-    # And a rectangle strands ceiling the engine does not.
-    assert wide.stranded > 0.0 and narrow.stranded > 0.0
-
-
 def test_passes_that_do_different_amounts_of_work_are_refused():
     """A median over passes that did different work is a median over a mixture."""
     durations = iter([9.0, 1.0, 1.0])
@@ -696,3 +541,8 @@ def test_passes_that_do_different_amounts_of_work_are_refused():
         run_mod.measure_level(
             run_mod.ENGINE_PAGED, "control", 1, stream, run_pass, log=lambda _: None
         )
+
+
+# --- F2: the MEASURED fragmentation plot -----------------------------------
+
+

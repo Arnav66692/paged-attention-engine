@@ -135,6 +135,14 @@ class Event:
     free_blocks: int
     running: int
     waiting: int
+    # Tokens actually stored across every running sequence at this moment.
+    #
+    # `free_blocks` reports CAPACITY -- what the pool has handed out. This is
+    # OCCUPANCY -- what is in it. The gap between them is internal fragmentation,
+    # and recording both here is what lets bench/plot.py draw a *measured*
+    # fragmentation plot rather than only the analytical one derived from the
+    # length distribution. Analytical explains why; this proves it happened.
+    tokens_held: int = 0
 
 
 @dataclass(frozen=True)
@@ -357,6 +365,20 @@ class Scheduler:
 
     # --- event log ---------------------------------------------------------
 
+    def _tokens_held(self) -> int:
+        """Tokens stored in the pool right now, across every running sequence.
+
+        Every call site logs after the running set and the allocator agree --
+        `_evict` and `_finish` both remove the sequence and free its blocks before
+        logging, and `_start` appends before the sequence has reserved anything --
+        so this never asks the allocator about a sequence it has dropped.
+        """
+        return sum(
+            self.allocator.num_tokens(seq.seq_id)
+            for seq in self.running
+            if seq.seq_id is not None
+        )
+
     def _log(self, kind: EventKind, seq: Sequence, detail: str = "") -> None:
         self.events.append(
             Event(
@@ -368,6 +390,7 @@ class Scheduler:
                 free_blocks=self.allocator.num_free,
                 running=len(self.running),
                 waiting=len(self.waiting),
+                tokens_held=self._tokens_held(),
             )
         )
 

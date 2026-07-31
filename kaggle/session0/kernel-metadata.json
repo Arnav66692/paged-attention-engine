@@ -1,0 +1,15 @@
+{
+  "id": "KAGGLE_USERNAME/paged-attention-session0",
+  "title": "paged attention session0 port verification",
+  "code_file": "session0.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": ["KAGGLE_USERNAME/paged-attention-repo"],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

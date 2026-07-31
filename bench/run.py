@@ -182,6 +182,8 @@ class LevelResult:
     max_resident: int | None = None
     unresolved: bool = False
     throughput_valid: bool = True
+    pool_trace: tuple[tuple[int, int, int, str], ...] = ()
+    trace_events_total: int = 0
 
     @property
     def median_seconds(self) -> float:
@@ -227,6 +229,9 @@ class LevelResult:
             "max_resident": self.max_resident,
             "unresolved": self.unresolved,
             "throughput_valid": self.throughput_valid,
+            "pool_trace": [list(point) for point in self.pool_trace],
+            "trace_events_total": self.trace_events_total,
+            "trace_downsampled": len(self.pool_trace) < self.trace_events_total,
         }
         tps = self.median_tokens_per_second
         record["median_tokens_per_second"] = round(tps, 4) if tps is not None else None
@@ -248,6 +253,13 @@ def _engine_requests(stream: Sequence) -> list[Request]:
     ]
 
 
+# Pool-trace points kept per level. The trace is the raw material for the
+# measured fragmentation plot and a long run produces tens of thousands of
+# events, so it is downsampled by striding above this. Truncation is recorded in
+# the result and logged, never silent.
+MAX_TRACE_POINTS = 4000
+
+
 @dataclass
 class EnginePass:
     elapsed: float
@@ -255,6 +267,10 @@ class EnginePass:
     preemptions: int
     num_rejected: int
     peak_blocks_used: int
+    # (step, blocks_allocated, tokens_held, event kind) at every scheduler
+    # decision. Capacity against occupancy, which is the measured fragmentation.
+    pool_trace: tuple[tuple[int, int, int, str], ...] = ()
+    trace_events_total: int = 0
 
 
 def run_engine_pass(
@@ -296,12 +312,28 @@ def run_engine_pass(
         (num_gpu_blocks - event.free_blocks for event in scheduler.events),
         default=0,
     )
+
+    # Capacity against occupancy at every decision. Strided rather than dropped
+    # from the tail, so a downsampled trace still spans the whole run.
+    stride = max(1, -(-len(scheduler.events) // MAX_TRACE_POINTS))
+    trace = tuple(
+        (
+            event.step,
+            num_gpu_blocks - event.free_blocks,
+            event.tokens_held,
+            event.kind.value,
+        )
+        for event in scheduler.events[::stride]
+    )
+
     return EnginePass(
         elapsed=elapsed,
         generated_tokens=sum(len(tokens) for tokens in outputs.values()),
         preemptions=len(scheduler.events_of(EventKind.PREEMPT)),
         num_rejected=rejected,
         peak_blocks_used=peak,
+        pool_trace=trace,
+        trace_events_total=len(scheduler.events),
     )
 
 
@@ -413,6 +445,10 @@ def measure_level(
             result.rejection_rate = (
                 observed.num_rejected / len(stream) if len(stream) else 0.0
             )
+            # Decoding is deterministic, so every pass traces the same pool
+            # history. Keeping the last is arbitrary and sufficient.
+            result.pool_trace = observed.pool_trace
+            result.trace_events_total = observed.trace_events_total
             log(f"    pass {index + 1}/{count}: {observed.elapsed:.4f}s")
 
     collect(MEASURED_PASSES)
@@ -461,6 +497,10 @@ def sweep(
                 throughput_valid=throughput_valid, log=log,
             )
             level.demanded_blocks = demanded
+            if level.trace_events_total > len(level.pool_trace):
+                log(f"    pool trace downsampled: {len(level.pool_trace)} of "
+                    f"{level.trace_events_total} events kept (stride sampling, "
+                    f"cap {MAX_TRACE_POINTS})")
             check_preemptions(level, demanded)
             results.append(level)
 
