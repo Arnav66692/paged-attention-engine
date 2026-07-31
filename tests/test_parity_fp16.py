@@ -79,46 +79,93 @@ FP16_MAX = 65504.0
 # own numbers, and carried across from nothing.
 #
 # It is NOT LOGIT_ATOL and NOT FUSED_LOGIT_ATOL. Neither is imported into this
-# module and `test_fp16_suite_is_collected` asserts both names are absent. It is
-# also not the bf16 file's 2.5e-1: that was derived for an 8-bit mantissa, and
-# fp16's is 10, so reusing it would be the wrong bound for the wrong format.
+# module and `test_fp16_suite_is_collected` asserts both names are absent.
 #
-#   1. Resolution. fp16 carries 10 explicit mantissa bits, so its unit roundoff
-#      is 2**-11 = 4.9e-4 and consecutive representable values are 2**-10 = 9.8e-4
-#      apart in relative terms. Four times finer than bfloat16's 2**-8, and about
-#      16,000 times coarser than float32's 2**-24.
+# TWO CORRECTIONS, AND THE REASON THIS DERIVATION IS WRITTEN OUT IN FULL.
 #
-#   2. Reductions are NOT the dominant term here, which is what makes this
-#      derivation different in kind from the float32 ones. cuBLAS accumulates
-#      fp16 GEMMs in float32 on both a T4 and a P100, so reordering the
-#      4864-term MLP projection perturbs it at float32 resolution -- the order
-#      1e-4 absolute that tests/test_parity.py already measures. Negligible at
-#      this scale.
+# FIRST: bf16 DOES NOT HAVE AN 8-BIT MANTISSA. The file this replaced said it
+# did, and every downstream number inherited the error. bfloat16 is 1 sign + 8
+# EXPONENT + 7 mantissa; the 8 belongs to the exponent, which is the whole point
+# of the format. torch.finfo(torch.bfloat16).eps is 2**-7 = 7.8e-3, not the
+# 2**-8 = 3.9e-3 that file claimed, so it understated one bf16 ulp by a factor of
+# two: at a logit of 16 the true ulp is 0.125, not the 0.0625 it computed. Its
+# declared bound of 2.5e-1 was therefore TWO true bf16 ulp, not the four it
+# said. `test_the_fp16_tolerance_is_the_mantissa_ratio_tighter` now reads both
+# widths off torch.finfo rather than from prose, so this cannot recur.
 #
-#   3. What fp16 actually costs is that the two implementations round each
-#      operation's output back into fp16 independently. Wherever their float32-
-#      level values straddle a rounding boundary the stored values differ by one
-#      ulp, and the residual stream carries that difference forward.
+# The consequence for the swap: fp16's 10 explicit mantissa bits are THREE more
+# than bf16's 7, not two, so the resolution gain is 8x and not 4x.
 #
-#   4. This model's logits reach magnitudes near 2.2e1, measured on the float32
-#      fixtures. 22 sits in the binade [16, 32), where one fp16 ulp is
-#      16 * 2**-10 = 1.5625e-2.
+# SECOND: the first version of this constant was 2e-1, a 20% tightening. That was
+# an artifact of silently changing the ERROR MODEL at the same time as the
+# format. bf16's bound was "the two implementations track to within a few ulp of
+# the final logit," with no layer-accumulation term at all. The 2e-1 derivation
+# instead assumed a full ulp of divergence per decoder layer accumulating as a
+# random walk over 24 layers and then doubled it, about ten ulp. Two derivations
+# on different error models cannot be compared, and quoting the ratio between
+# them as a tightening is exactly the mistake. Under one model, the bound below
+# is 8x tighter than a consistently derived bf16 bound would be, which is what
+# three mantissa bits buy.
 #
-#   5. Take one such divergence per decoder layer and let the 24 of them
-#      accumulate as a random walk: sqrt(24) = 4.9, so about 5 ulp, or 7.7e-2.
-#      Double it for the attention softmax and the lm_head projection, two more
-#      places the two paths round independently, giving 1.6e-1.
+# THE DERIVATION, on one model throughout, anchored on measurements rather than
+# assumptions wherever a measurement exists.
 #
-# 2e-1 is that, rounded up. It sits below the bf16 file's 2.5e-1, which is the
-# right direction for a format with four times the mantissa resolution.
+#   1. RESOLUTION. fp16 carries 10 explicit mantissa bits, so its unit roundoff
+#      is 2**-11 = 4.88e-4 and consecutive representable values are
+#      2**-10 = 9.77e-4 apart relatively -- eight times finer than bfloat16's
+#      2**-7, and about 8,200 times coarser than float32's 2**-23. This model's
+#      logits reach 2.24e1, measured on the float32 fixtures, which sits in the
+#      binade [16, 32) where one fp16 ulp is 16 * 2**-10 = 1.5625e-2.
+#
+#   2. REDUCTION ORDER IS NOT THE DOMINANT TERM, and this is the finding that
+#      makes the rest of the derivation work. cuBLAS accumulates fp16 GEMMs in
+#      float32 on both a T4 and a P100, and SDPA accumulates its two matmuls in
+#      float32 as well, so reordering them perturbs the result at *float32*
+#      resolution. tests/test_parity.py measures that directly: 2.575e-05
+#      absolute on logits of 2.24e1, or 1.15e-6 relative. That is 1/850th of one
+#      fp16 ulp. It cannot dominate anything, and the two extra mantissa bits do
+#      not help with it either way.
+#
+#   3. WHAT fp16 ACTUALLY COSTS is that both implementations round each
+#      operation's output back into fp16 independently. Two values 1.15e-6 apart
+#      relatively round to the same fp16 value unless they straddle a boundary,
+#      which happens with probability about 1.15e-6 / 9.77e-4 = 1.2e-3 per
+#      rounding. When they do straddle, they differ by exactly one ulp.
+#
+#   4. DIVERGENCE SATURATES RATHER THAN COMPOUNDING. Once an element differs by
+#      one ulp it is 850 times further apart than the float32-level difference
+#      that caused it, so it is no longer a rare straddle -- but a decoder
+#      layer's residual map is close to Lipschitz-1 in this regime, so a one-ulp
+#      relative difference neither shrinks nor multiplies as it is carried
+#      forward. The steady state is the two hidden states tracking each other at
+#      order one ulp, not one ulp per layer accumulating. This is the step the
+#      2e-1 derivation got wrong.
+#
+#   5. ACCUMULATION is then only the fresh half-ulp of rounding noise each layer
+#      contributes, adding as a random walk: sqrt(24) * 0.5 = 2.4 ulp. With the
+#      steady-state term of about 1 ulp and the lm_head's own rounding, roughly
+#      3.4 ulp, bounded at 4.
+#
+# 4 * 1.5625e-2 = 6.25e-2.
+#
+# CONSISTENCY CHECK, not the derivation. The same model applied to bf16 gives
+# 4 * (16 * 2**-7) = 5e-1, so this bound is exactly 8x tighter -- the ratio of
+# the two mantissa widths, as it must be once the model is held fixed. Arriving
+# there independently is what shows the model was applied rather than the ratio
+# assumed. Note this is NOT one quarter of the 2.5e-1 the bf16 file declared:
+# that value was two true bf16 ulp under a model with no accumulation term, and
+# comparing against it directly is what produced the 2e-1 mistake above.
+#
+# HEADROOM IS THIN, DELIBERATELY. The derivation expects about 3.4 ulp and the
+# bound is 4, so roughly 18%. A wider bound would cost real ground: this
+# tolerance is what would catch a recompute divergence in fp16 before it became a
+# token flip, and a bound eight times looser than the format earns cannot see one.
 #
 # TOKEN EQUALITY, asserted below, is the real gate. It is not a tolerance and
-# cannot be relaxed. This constant only bounds how far the logits may drift while
-# still producing the same argmax, and the measured deviation is printed for
-# every configuration. No CUDA device was available when it was derived, so it is
+# cannot be relaxed. No CUDA device was available when this was derived, so it is
 # a prediction rather than a fitted value; if the benchmark host disagrees, the
-# measurement is reported and this number is not moved to accommodate it.
-FP16_LOGIT_ATOL = 2e-1
+# measured deviation is reported as a result and this number does not move.
+FP16_LOGIT_ATOL = 6.25e-2
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -280,17 +327,67 @@ def test_fp16_suite_is_collected():
     import errors loudly if it ever breaks.
     """
     assert FP16_DTYPE is torch.float16
-    assert FP16_LOGIT_ATOL == 2e-1
+    assert FP16_LOGIT_ATOL == 6.25e-2
     # Declared here, not borrowed. Neither float32 tolerance is imported into
     # this module, so neither can be reused or quietly widened.
     assert "LOGIT_ATOL" not in globals()
     assert "FUSED_LOGIT_ATOL" not in globals()
-    # And not carried across from the bf16 version this file replaced.
-    assert FP16_LOGIT_ATOL != 2.5e-1
 
     # fp16 and bf16 are both two bytes, so nothing sized in bytes moved with the
-    # swap. The mantissa is the whole difference, and it is why the tolerance is
-    # tighter rather than equal.
+    # swap. The mantissa is the whole difference.
     assert torch.finfo(FP16_DTYPE).bits == torch.finfo(torch.bfloat16).bits == 16
     assert torch.finfo(FP16_DTYPE).max == FP16_MAX
     assert torch.finfo(FP16_DTYPE).eps < torch.finfo(torch.bfloat16).eps
+
+
+DERIVED_ULP_COUNT = 4.0
+# 2.24e1 measured on the float32 fixtures, so the largest logits sit in [16, 32).
+LOGIT_BINADE_BASE = 16.0
+
+
+def test_the_fp16_tolerance_is_the_mantissa_ratio_tighter():
+    """The tightening the extra mantissa bits earn, read off torch.finfo.
+
+    Both widths come from torch.finfo rather than from prose, because prose is
+    how the file this replaced came to believe bf16 had an 8-bit mantissa. It has
+    7 -- the 8 is the exponent -- so the resolution gain from bf16 to fp16 is 8x
+    and not 4x, and every ulp that file computed was half the true size.
+
+    Held fixed at DERIVED_ULP_COUNT, the same error model gives a bf16 bound of
+    4 ulp and an fp16 bound of 4 ulp, so the absolute bounds must differ by
+    exactly the resolution ratio. If they ever do not, the two were derived under
+    different models and are not comparable -- which is the specific mistake that
+    produced a 20% "tightening" the first time.
+    """
+    bf16_eps = torch.finfo(torch.bfloat16).eps
+    fp16_eps = torch.finfo(FP16_DTYPE).eps
+    resolution_ratio = bf16_eps / fp16_eps
+
+    one_fp16_ulp = LOGIT_BINADE_BASE * fp16_eps
+    one_bf16_ulp = LOGIT_BINADE_BASE * bf16_eps
+    consistent_bf16_bound = DERIVED_ULP_COUNT * one_bf16_ulp
+
+    print(f"\nbf16 eps {bf16_eps:.4e} (2**-7, 7 explicit mantissa bits)")
+    print(f"fp16 eps {fp16_eps:.4e} (2**-10, 10 explicit mantissa bits)")
+    print(f"resolution ratio: {resolution_ratio:.1f}x  (3 bits, not 2)")
+    print(f"one ulp at |logit| ~2.2e1: bf16 {one_bf16_ulp:.4e}, fp16 {one_fp16_ulp:.4e}")
+    print(f"same model, bf16 would be {consistent_bf16_bound:.4e}; "
+          f"fp16 is {FP16_LOGIT_ATOL:.4e} ({consistent_bf16_bound / FP16_LOGIT_ATOL:.1f}x tighter)")
+
+    # bf16 is 1 sign + 8 exponent + 7 mantissa. The 8 is not the mantissa.
+    assert bf16_eps == pytest.approx(2.0**-7)
+    assert fp16_eps == pytest.approx(2.0**-10)
+    assert resolution_ratio == pytest.approx(8.0)
+
+    # The bound is exactly the derived ulp count, at this model's logit scale.
+    assert FP16_LOGIT_ATOL == pytest.approx(DERIVED_ULP_COUNT * one_fp16_ulp)
+    # And the same model on bf16 differs by exactly the resolution ratio.
+    assert consistent_bf16_bound / FP16_LOGIT_ATOL == pytest.approx(resolution_ratio), (
+        "the fp16 bound is not tighter than a consistently derived bf16 bound by "
+        "the ratio the mantissa earns, so the two rest on different error models"
+    )
+
+    # The predecessor's declared value was two TRUE bf16 ulp, not the four it
+    # claimed, because it halved the ulp. Recorded so the discrepancy is not
+    # rediscovered as a surprise.
+    assert 2.5e-1 / one_bf16_ulp == pytest.approx(2.0)
