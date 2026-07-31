@@ -13,6 +13,7 @@ need the GPU. This only guarantees the script gets far enough to test them.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -223,3 +224,34 @@ def test_the_repo_tree_holds_no_credential_file():
         if ".venv" not in path.parts and ".git" not in path.parts
     ]
     assert not found, f"credential-shaped file(s) in the repo tree: {found}"
+
+
+def _slugify(title: str) -> str:
+    """Kaggle's own rule: lowercase, non-alphanumerics collapse to hyphens."""
+    return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+
+
+@pytest.mark.parametrize("session", ("preflight", "session0"))
+def test_kernel_id_matches_the_slug_kaggle_will_derive(session):
+    """The id must equal slugify(title), or the push 409s.
+
+    Kaggle derives a NEW kernel's slug from its TITLE and ignores the id. With
+    id `paged-attention-session0` and title "paged attention session0 port
+    verification" it created `paged-attention-session0-port-verification`, so
+    polling the id queried a kernel that did not exist -- and `kernels status`
+    answered with a permission error containing none of the words the poller
+    looks for, so it would have spun for twelve hours on a run that had already
+    finished. The next push then 409'd, because the id it asked to create was a
+    slug the title had already claimed.
+    """
+    metadata = json.loads(
+        (KAGGLE_DIR / session / "kernel-metadata.json").read_text()
+    )
+    owner, _, slug = metadata["id"].partition("/")
+    expected = _slugify(metadata["title"])
+    print(f"\n{session}: title={metadata['title']!r} -> slug {expected!r}, id slug {slug!r}")
+    assert slug == expected, (
+        f"kernel id slug {slug!r} != slugify(title) {expected!r}; Kaggle will "
+        "create the title's slug and the id will point at nothing"
+    )
+    assert owner == "KAGGLE_USERNAME"

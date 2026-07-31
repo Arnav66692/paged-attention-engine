@@ -25,6 +25,7 @@ scratch copy. The templates in git stay generic.
 
 import argparse
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -163,8 +164,22 @@ def push_dataset(dataset_dir: Path, username: str) -> None:
     )
 
 
-def push_kernel(kernel_dir: Path) -> None:
-    kaggle("kernels", "push", "-p", str(kernel_dir))
+def push_kernel(kernel_dir: Path) -> str | None:
+    """Push, and return the slug Kaggle ACTUALLY created.
+
+    Not the id from the metadata. Kaggle derives a new kernel's slug from its
+    TITLE, so a metadata id of paged-attention-session0 with the title
+    "paged attention session0 port verification" becomes
+    paged-attention-session0-port-verification. Polling the id then queries a
+    kernel that does not exist, and `kernels status` answers with a permission
+    error containing none of the words poll() looks for -- so it would have spun
+    until the 12 hour timeout on a run that had already finished.
+
+    The push output carries the real URL. Take the slug from there.
+    """
+    result = kaggle("kernels", "push", "-p", str(kernel_dir))
+    match = re.search(r"kaggle\.com/code/([\w-]+/[\w-]+)", result.stdout or "")
+    return match.group(1) if match else None
 
 
 def poll(slug: str) -> str:
@@ -216,7 +231,10 @@ def main(argv=None) -> int:
     dataset_dir, kernel_dir = stage(username, args.session)
 
     push_dataset(dataset_dir, username)
-    push_kernel(kernel_dir)
+    pushed = push_kernel(kernel_dir)
+    if pushed and pushed != slug:
+        print(f"note: Kaggle slugified the title -- polling {pushed}, not {slug}")
+        slug = pushed
     if args.no_wait:
         print(f"pushed {slug}; not waiting")
         return 0
