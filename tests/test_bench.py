@@ -513,6 +513,11 @@ def test_bench_workload_is_still_frozen():
     )
 
 
+@pytest.mark.skipif(
+    not (REPO_ROOT / ".git").exists(),
+    reason="no .git in the measurement payload; the CONTENT HASH check above "
+           "still runs there and is the one that matters",
+)
 def test_bench_workload_has_no_uncommitted_edit():
     """And it is frozen in the working tree, not merely in the last commit."""
     result = subprocess.run(

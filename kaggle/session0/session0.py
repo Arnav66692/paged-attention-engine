@@ -25,11 +25,19 @@ session.
 
 import json
 import os
-import shutil
-import subprocess
-import sys
-import time
-from pathlib import Path
+
+# ONE GPU, pinned before anything can import torch. Kaggle hands out dual T4 and
+# the whole design is single-GPU: the KV ceiling of 1,644,167,168 bytes is sized
+# against ONE 15360 MiB card. torch caches the device list at CUDA init, so this
+# is only effective here, above the imports. conftest.py does the same for a
+# direct pytest run.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+import time  # noqa: E402
+from pathlib import Path  # noqa: E402
 
 # Kaggle's real mounts, overridable so this script can be dry-run off-Kaggle.
 # tests/test_kaggle_session.py drives the whole thing against a fake mount on
@@ -125,7 +133,44 @@ try:
         if torch.cuda.is_available() else None,
         "bf16_supported": bool(torch.cuda.is_bf16_supported())
         if torch.cuda.is_available() else False,
+        "device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
     })
+
+    # TF32 carries 10 explicit mantissa bits -- exactly fp16's. An fp32 matmul
+    # silently executed in TF32 deviates at fp16 scale, roughly 4.7e-2 for this
+    # model, against LOGIT_ATOL of 1e-3. Forty-seven times over, on the float32
+    # parity tests, and indistinguishable from a paging bug on a new device.
+    # conftest.py pins these before any test runs; this records what the host
+    # had BEFORE that, which is the number worth reporting.
+    precision = {}
+    for label, path, attribute in (
+        ("torch.backends.cuda.matmul.allow_tf32", "backends.cuda.matmul", "allow_tf32"),
+        ("torch.backends.cudnn.allow_tf32", "backends.cudnn", "allow_tf32"),
+        ("torch.backends.cuda.matmul.fp32_precision", "backends.cuda.matmul", "fp32_precision"),
+        ("torch.backends.cudnn.fp32_precision", "backends.cudnn", "fp32_precision"),
+        ("torch.backends.cudnn.conv.fp32_precision", "backends.cudnn.conv", "fp32_precision"),
+        ("torch.backends.fp32_precision", "backends", "fp32_precision"),
+        ("torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction",
+         "backends.cuda.matmul", "allow_fp16_reduced_precision_reduction"),
+    ):
+        holder = torch
+        for part in path.split("."):
+            holder = getattr(holder, part, None)
+            if holder is None:
+                break
+        if holder is not None and hasattr(holder, attribute):
+            try:
+                precision[label] = getattr(holder, attribute)
+            except RuntimeError:
+                pass
+    try:
+        precision["torch.get_float32_matmul_precision()"] = (
+            torch.get_float32_matmul_precision()
+        )
+    except (AttributeError, RuntimeError):
+        pass
+    env["fp32_precision_defaults"] = precision
 except Exception as error:  # noqa: BLE001 -- record anything, diagnose later
     env["torch_import_error"] = repr(error)
 

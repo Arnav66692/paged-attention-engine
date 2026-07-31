@@ -18,7 +18,10 @@ from pathlib import Path
 
 import pytest
 
+import torch
+
 import conftest
+from tests.devices import model_devices
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -68,10 +71,11 @@ def test_fast_drops_only_the_other_device_and_the_other_prompt_lengths(collectio
     dropped = gate - fast
 
     other_lengths = {13, 32}
+    other_devices = {"cpu", "cuda", "mps"} - {conftest.FAST_DEVICE}
     unexplained = []
     for node_id in dropped:
         params = node_id.partition("[")[2].rstrip("]").split("-") if "[" in node_id else []
-        by_device = any(part not in (conftest.FAST_DEVICE,) and part == "mps" for part in params)
+        by_device = any(part in other_devices for part in params)
         by_length = any(part.isdigit() and int(part) in other_lengths for part in params)
         if not (by_device or by_length):
             unexplained.append(node_id)
@@ -100,4 +104,13 @@ def test_fast_selection_constants_mean_what_conftest_claims():
         f"a {BLOCK_SIZE}-token block boundary, so it is no longer the hardest of "
         "the fixture lengths"
     )
-    assert conftest.FAST_DEVICE == "cpu"
+    # The fast device is this host's ACCELERATOR, not a hardcoded "cpu". It was
+    # "cpu" once, and on the Kaggle T4 host that made --fast run the whole model
+    # tier on CPU -- a port-verification session that could not touch the GPU.
+    assert conftest.FAST_DEVICE in {"cpu", "cuda", "mps"}
+    assert conftest.FAST_DEVICE in model_devices()
+    if torch.cuda.is_available():
+        assert conftest.FAST_DEVICE == "cuda", (
+            "on a CUDA host the fast selection must exercise CUDA, or it verifies "
+            "nothing about the port"
+        )

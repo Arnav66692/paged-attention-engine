@@ -28,7 +28,35 @@ SESSION0 = KAGGLE_DIR / "session0" / "session0.py"
 # The subset the dry run points pytest at: fast, and needs no model download.
 DRY_RUN_TESTS = ("test_alloc.py",)
 
+# Package infrastructure the fake mount must also carry. conftest.py imports
+# tests.devices, so a payload with conftest.py but without these fails to load
+# conftest at all -- pytest exit 4, before a single test is collected. The real
+# dataset ships the whole tests/ directory so it is fine there; this list keeps
+# the dry run honest about what conftest actually depends on.
+DRY_RUN_SUPPORT = ("__init__.py", "devices.py")
 
+# The measurement payload ships engine/, bench/, tests/ and the two config files
+# -- see REPO_INCLUDE in kaggle/push.py -- and deliberately NOT kaggle/ or .git.
+# Tests that need either are about the local development environment, not about
+# the engine, so on the measurement host they SKIP. They failed there before, 13
+# of them, and 13 red lines that mean "you are not on a dev box" drown the ones
+# that mean something.
+#
+# tests/test_bench.py keeps the same distinction on purpose: the frozen-workload
+# CONTENT HASH runs everywhere including the measurement host, because that is
+# the check that matters there. Only its .git-dependent sibling skips.
+HAVE_KAGGLE_DIR = (KAGGLE_DIR / "session0" / "session0.py").exists()
+HAVE_GIT = (REPO_ROOT / ".git").exists()
+
+needs_kaggle_dir = pytest.mark.skipif(
+    not HAVE_KAGGLE_DIR, reason="kaggle/ is not shipped in the measurement payload"
+)
+needs_git = pytest.mark.skipif(
+    not HAVE_GIT, reason="no .git in the measurement payload"
+)
+
+
+@needs_kaggle_dir
 def test_session0_script_exists_and_parses():
     import ast
 
@@ -36,6 +64,7 @@ def test_session0_script_exists_and_parses():
     ast.parse(SESSION0.read_text())
 
 
+@needs_kaggle_dir
 def test_kernel_metadata_requests_gpu_and_internet():
     """Both flags are required and neither is the default."""
     metadata = json.loads((KAGGLE_DIR / "session0" / "kernel-metadata.json").read_text())
@@ -53,6 +82,7 @@ def test_kernel_metadata_requests_gpu_and_internet():
     assert metadata["dataset_sources"], "no dataset attached, so no repo on the host"
 
 
+@needs_kaggle_dir
 def test_metadata_templates_carry_no_real_username():
     """The account is not known yet; kaggle/push.py substitutes at stage time."""
     for name in ("session0/kernel-metadata.json", "dataset/dataset-metadata.json"):
@@ -60,6 +90,7 @@ def test_metadata_templates_carry_no_real_username():
         assert "KAGGLE_USERNAME" in text, f"{name} lost its placeholder"
 
 
+@needs_kaggle_dir
 def test_push_stages_a_payload_without_credentials(tmp_path):
     """Staging must work while the account is still blocked."""
     result = subprocess.run(
@@ -85,6 +116,7 @@ def test_push_stages_a_payload_without_credentials(tmp_path):
     assert not (payload / ".git").exists()
 
 
+@needs_kaggle_dir
 def test_push_reports_the_credential_blocker_precisely():
     """A blocked run must say what is missing and who can fix it."""
     if (Path.home() / ".kaggle" / "kaggle.json").exists():
@@ -101,6 +133,7 @@ def test_push_reports_the_credential_blocker_precisely():
 
 
 @pytest.mark.slow
+@needs_kaggle_dir
 def test_session0_runs_end_to_end_against_a_fake_mount(tmp_path):
     """The whole kernel script, on CPU, against a fake /kaggle layout.
 
@@ -118,7 +151,7 @@ def test_session0_runs_end_to_end_against_a_fake_mount(tmp_path):
     for name in ("engine", "bench"):
         shutil.copytree(REPO_ROOT / name, mount / "repo" / name, ignore=ignore)
     (mount / "repo" / "tests").mkdir()
-    for name in DRY_RUN_TESTS:
+    for name in DRY_RUN_TESTS + DRY_RUN_SUPPORT:
         shutil.copy2(REPO_ROOT / "tests" / name, mount / "repo" / "tests" / name)
     for name in ("conftest.py", "pytest.ini"):
         shutil.copy2(REPO_ROOT / name, mount / "repo" / name)
@@ -186,6 +219,7 @@ CREDENTIAL_PATHS = (
 )
 
 
+@needs_git
 def test_git_tracks_no_kaggle_credential():
     """A tracked API token is an account takeover. Checked, not assumed.
 
@@ -205,6 +239,7 @@ def test_git_tracks_no_kaggle_credential():
 
 
 @pytest.mark.parametrize("path", CREDENTIAL_PATHS)
+@needs_git
 def test_gitignore_would_catch_a_stray_credential(path):
     """Every plausible place a token could land must already be ignored."""
     result = subprocess.run(
@@ -232,6 +267,7 @@ def _slugify(title: str) -> str:
 
 
 @pytest.mark.parametrize("session", ("preflight", "session0"))
+@needs_kaggle_dir
 def test_kernel_id_matches_the_slug_kaggle_will_derive(session):
     """The id must equal slugify(title), or the push 409s.
 

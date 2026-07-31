@@ -43,6 +43,7 @@ from engine.cache import (
     PagedCacheSpec,
     PagedKVCache,
 )
+from tests.devices import model_devices
 from engine.scheduler import (
     EventKind,
     ExecutionMode,
@@ -499,10 +500,8 @@ MODEL_REQUEST_SHAPES = ((13, 6), (20, 5), (32, 7), (33, 4))
 
 
 def _devices() -> list[str]:
-    devices = ["cpu"]
-    if torch.backends.mps.is_available():
-        devices.append("mps")
-    return devices
+    """cpu plus this host's accelerator. See tests/devices.py for why."""
+    return model_devices()
 
 
 @pytest.fixture(scope="module", params=_devices())

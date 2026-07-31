@@ -42,6 +42,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from engine.attention import PagedBackend
 from engine.cache import BLOCK_SIZE, BlockAllocator
 from engine.model import Qwen2Engine
+from tests.devices import model_devices
 
 DEV_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 
@@ -96,10 +97,8 @@ class Runtime:
 
 
 def _devices() -> list[str]:
-    devices = ["cpu"]
-    if torch.backends.mps.is_available():
-        devices.append("mps")
-    return devices
+    """cpu plus this host's accelerator. See tests/devices.py for why."""
+    return model_devices()
 
 
 @pytest.fixture(scope="module", params=_devices())

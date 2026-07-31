@@ -40,6 +40,7 @@ result file that looks like every other result file.
 
 import argparse
 import json
+import os
 import platform
 import statistics
 import subprocess
@@ -121,6 +122,16 @@ def _model_sha(model_id: str) -> str | None:
         return None
 
 
+def _precision_settings() -> dict:
+    """Whatever precision knobs this torch exposes, by their real names."""
+    try:
+        import conftest
+
+        return dict(conftest.FP32_PRECISION_PINNED or conftest.FP32_PRECISION_DEFAULTS)
+    except Exception:  # noqa: BLE001 -- provenance never blocks a run
+        return {}
+
+
 @dataclass(frozen=True)
 class Provenance:
     """Everything needed to say what produced a number, or that it is unknown."""
@@ -139,6 +150,9 @@ class Provenance:
     model_sha: str | None
     workload_digest: str
     cuda_available: bool
+    visible_cuda_devices: int
+    cuda_visible_devices_env: str | None
+    fp32_precision: dict
 
     @classmethod
     def collect(cls, model_id: str, dtype: str, stream_digest: str) -> "Provenance":
@@ -157,6 +171,14 @@ class Provenance:
             model_sha=_model_sha(model_id),
             workload_digest=stream_digest,
             cuda_available=torch.cuda.is_available(),
+            visible_cuda_devices=(
+                torch.cuda.device_count() if torch.cuda.is_available() else 0
+            ),
+            cuda_visible_devices_env=os.environ.get('CUDA_VISIBLE_DEVICES'),
+            # TF32 has fp16's mantissa. An fp32 matmul silently run in TF32
+            # deviates at fp16 scale, so what these were set to is part of
+            # what produced the number.
+            fp32_precision=_precision_settings(),
         )
 
 
