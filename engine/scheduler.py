@@ -244,6 +244,12 @@ class StepResult:
     # were made. A sequence evicted after being planned but before the flush is
     # not counted, because it did not run.
     batch_size: int = 0
+    # Sequences that were ready to decode but did not fit this step's token
+    # budget. Not preempted -- they keep their blocks and run next step.
+    deferred: tuple[str, ...] = ()
+    # Padded token slots the step's forward materialised. See
+    # `Scheduler.batched_token_cost`.
+    batched_token_cost: int = 0
 
 
 class Executor(Protocol):
@@ -316,6 +322,8 @@ class Scheduler:
         clock: Callable[[], float] = time.monotonic,
         mode: ExecutionMode = ExecutionMode.FUSED,
         record_logits: bool = False,
+        max_num_seqs: int | None = None,
+        max_num_batched_tokens: int | None = None,
     ) -> None:
         if admission_margin_blocks < 0:
             raise ValueError(
@@ -327,6 +335,18 @@ class Scheduler:
         self.clock = clock
         self.mode = mode
         self.record_logits = record_logits
+        # Two capacity caps, the vLLM pattern. Both are capacity conditions on
+        # the same strict-FCFS order -- neither reorders the queue and neither
+        # lets anything jump the head. None means unbounded, which is what the
+        # scheduler did before and is kept so existing fixtures are unchanged.
+        if max_num_seqs is not None and max_num_seqs < 1:
+            raise ValueError(f'max_num_seqs must be at least 1, got {max_num_seqs}')
+        if max_num_batched_tokens is not None and max_num_batched_tokens < 1:
+            raise ValueError(
+                f'max_num_batched_tokens must be at least 1, got {max_num_batched_tokens}'
+            )
+        self.max_num_seqs = max_num_seqs
+        self.max_num_batched_tokens = max_num_batched_tokens
 
         self.waiting: deque[Sequence] = deque()
         self.running: list[Sequence] = []
@@ -342,6 +362,7 @@ class Scheduler:
         # non-empty in FUSED mode, between planning and the flush.
         self._pending: list[ScheduledWork] = []
         self._ran: list[ScheduledWork] = []
+        self._last_token_cost = 0
 
     # --- capacity ----------------------------------------------------------
 
@@ -429,13 +450,67 @@ class Scheduler:
 
     # --- scheduling --------------------------------------------------------
 
+    # --- capacity caps -----------------------------------------------------
+
+    def _seq_cap_reached(self) -> bool:
+        """True once the running set is at `max_num_seqs`."""
+        return (
+            self.max_num_seqs is not None
+            and len(self.running) >= self.max_num_seqs
+        )
+
+    def batched_token_cost(self, extra_len: int | None = None) -> int:
+        """Token slots this step's forward will MATERIALISE, not merely contain.
+
+        The distinction is the whole point. In FUSED mode the batch is padded to
+        its widest member, so N sequences of one token each sharing a step with a
+        2048-token prefill cost (N + 1) * 2048 slots, not N + 2048. Bounding the
+        *real* token count -- which is what vLLM's max_num_batched_tokens does,
+        because its kernels are varlen and never pad -- would not bound this
+        engine's memory at all. So the cap here is on the padded rectangle, and
+        that deviation is deliberate.
+
+        In UNFUSED mode each sequence runs alone, so the cost is the plain sum.
+        """
+        lengths = [len(work.token_ids) for work in self._pending]
+        if extra_len is not None:
+            lengths.append(extra_len)
+        if not lengths:
+            return 0
+        if self.mode is ExecutionMode.FUSED:
+            return len(lengths) * max(lengths)
+        return sum(lengths)
+
+    def _token_budget_allows(self, extra_len: int) -> bool:
+        """Room for one more row of `extra_len` tokens in this step's forward.
+
+        An EMPTY batch always admits the head, whatever its length. Without that
+        escape a request longer than the cap could never run at any point, which
+        is a livelock -- the same failure the admission guard exists to prevent,
+        arriving by a different route.
+        """
+        if self.max_num_batched_tokens is None or not self._pending:
+            return True
+        return self.batched_token_cost(extra_len) <= self.max_num_batched_tokens
+
     def _admit(self) -> list[Sequence]:
-        """Admit from the head while it fits. Strict FCFS, no backfilling."""
+        """Admit from the head while it fits. Strict FCFS, no backfilling.
+
+        Three capacity conditions now, all applied to the same FCFS order and
+        none of them reordering it: blocks must be free, the running set must be
+        under `max_num_seqs`, and the step's padded forward must stay under
+        `max_num_batched_tokens`. A head that fails any of them stops the step
+        and keeps its place; nothing behind it is considered.
+        """
         admitted: list[Sequence] = []
         while self.waiting:
             head = self.waiting[0]
+            if self._seq_cap_reached():
+                break
             if not self._admission_fits(head):
                 # The head keeps its place and nothing behind it is considered.
+                break
+            if not self._token_budget_allows(head.history_len):
                 break
             self.waiting.popleft()
             self._start(head)
@@ -506,6 +581,7 @@ class Scheduler:
             self._pending.append(work)
             return
 
+        self._last_token_cost += len(work.token_ids)
         logits = self.executor.forward(work.token_ids, work.positions, work.seq.backend)
         self._ran.append(work)
         self._append_token(work.seq, logits)
@@ -516,6 +592,7 @@ class Scheduler:
             return
 
         batch = self._pending
+        self._last_token_cost = self.batched_token_cost()
         self._pending = []
         logits = self.executor.forward_batch(tuple(work.as_input() for work in batch))
         if logits.shape[0] != len(batch):
@@ -621,11 +698,13 @@ class Scheduler:
         self._step += 1
         self._pending = []
         self._ran = []
+        self._last_token_cost = 0
 
         admitted = self._admit()
         admitted_ids = {id(seq) for seq in admitted}
 
         preempted: list[str] = []
+        deferred: list[str] = []
         finished_before = set(self.finished)
 
         # Snapshot: the running set is mutated mid-loop by finishes and evictions.
@@ -634,6 +713,16 @@ class Scheduler:
                 continue  # its prefill already covers this step's token
             if seq.status is not SequenceStatus.RUNNING:
                 continue  # finished or evicted earlier in this same step
+
+            # The token budget binds decodes too, and it has to. A decode adds
+            # one real token but a whole ROW of the padded rectangle, so 60
+            # decodes joining a 2048-token prefill cost 61 * 2048 slots -- which
+            # is exactly the shape that ran a 15 GB card out of memory. A
+            # sequence refused here is not preempted and keeps its blocks; it
+            # simply decodes on the next step.
+            if not self._token_budget_allows(1):
+                deferred.append(seq.request_id)
+                continue
 
             if not self._decode_fits(seq):
                 victims = self._make_room_for(seq)
@@ -657,6 +746,8 @@ class Scheduler:
             waiting=len(self.waiting),
             free_blocks=self.allocator.num_free,
             batch_size=len(self._ran),
+            deferred=tuple(deferred),
+            batched_token_cost=self._last_token_cost,
         )
 
     def run_to_completion(self, max_steps: int = 100_000) -> dict[str, tuple[int, ...]]:

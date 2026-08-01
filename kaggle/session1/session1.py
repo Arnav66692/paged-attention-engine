@@ -280,6 +280,18 @@ torch.cuda.empty_cache()
 
 section("PART 4: memory headroom on 15 GB, headline model")
 
+# Pinned for BOTH engines and recorded. Session 1 measured this moving the fp16
+# deviation by up to 0.75 ulp, so it is not a free knob.
+run_mod_pin = None
+try:
+    from bench.run import ALLOW_FP16_REDUCED_PRECISION_REDUCTION, pin_fp16_reduction
+
+    run_mod_pin = pin_fp16_reduction()
+    print(f"pinned allow_fp16_reduced_precision_reduction="
+          f"{ALLOW_FP16_REDUCED_PRECISION_REDUCTION} (applied={run_mod_pin})", flush=True)
+except Exception as error:  # noqa: BLE001
+    print(f"could not pin fp16 reduction: {error!r}", file=sys.stderr, flush=True)
+
 from bench import baseline as baseline_mod  # noqa: E402
 from bench import workload  # noqa: E402
 from bench.workload import NUM_GPU_BLOCKS  # noqa: E402
@@ -288,7 +300,7 @@ from engine.scheduler import (  # noqa: E402
     EventKind, ExecutionMode, Qwen2Executor, Request, Scheduler,
 )
 
-part4 = {}
+part4 = {"fp16_reduction_pinned": run_mod_pin}
 total_bytes = torch.cuda.get_device_properties(0).total_memory
 part4["device_total_bytes"] = total_bytes
 part4["device_total_gib"] = round(total_bytes / 2**30, 2)
@@ -374,12 +386,28 @@ section("PART 4b: peak allocated / reserved at C=8, 64, 87")
 
 MEASURE_STEPS = int(os.environ.get("SESSION1_STEPS", "25"))
 
+# The padded-rectangle budget. The uncapped run OOM'd at C=8 materialising
+# 64 rows x 2048 = 131,072 padded slots; this is 16x smaller. It is a starting
+# point to be measured, not a derived constant -- if it still OOMs that is the
+# result to report.
+MAX_NUM_BATCHED_TOKENS = int(os.environ.get("SESSION1_BATCHED_TOKENS", "8192"))
+
 
 class ShapeRecorder:
+    """Records the batch shapes a run actually reached.
+
+    Its counters live on the recorder, not in the try block's locals, because
+    the previous session assigned them into the result dict only on the SUCCESS
+    path -- so all three OOM runs lost max_batch_width and max_query_len, which
+    were the two numbers that would have explained the OOM.
+    """
+
     def __init__(self, inner):
         self.inner = inner
         self.max_batch = 0
         self.max_query = 0
+        self.max_padded_slots = 0
+        self.calls = 0
 
     def new_backend(self, seq_id):
         return self.inner.new_backend(seq_id)
@@ -391,9 +419,15 @@ class ShapeRecorder:
         return self.inner.forward(t, p, b)
 
     def forward_batch(self, inputs):
+        # Record BEFORE delegating. If the forward OOMs, these are the shapes
+        # that caused it and they must already be saved.
+        self.calls += 1
+        widths = [len(i.token_ids) for i in inputs]
         self.max_batch = max(self.max_batch, len(inputs))
-        self.max_query = max(
-            [self.max_query] + [len(i.token_ids) for i in inputs])
+        self.max_query = max([self.max_query] + widths)
+        if widths:
+            self.max_padded_slots = max(
+                self.max_padded_slots, len(widths) * max(widths))
         return self.inner.forward_batch(inputs)
 
 
@@ -413,7 +447,17 @@ for concurrency in (8, 64, 87):
         entry["kv_pool_bytes"] = cache.storage_bytes()
         entry["kv_pool_gib"] = round(cache.storage_bytes() / 2**30, 3)
         executor = ShapeRecorder(Qwen2Executor(head_engine, cache, allocator))
-        scheduler = Scheduler(executor, allocator, mode=ExecutionMode.FUSED)
+        # THE CAPS. max_num_seqs = C is what makes C mean anything: without it
+        # admission was by pool fit alone, so C=1,2,4,8,16 all admitted the same
+        # 64 requests. max_num_batched_tokens bounds the padded rectangle, which
+        # is what actually allocates.
+        scheduler = Scheduler(
+            executor, allocator, mode=ExecutionMode.FUSED,
+            max_num_seqs=concurrency,
+            max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
+        )
+        entry["max_num_seqs"] = concurrency
+        entry["max_num_batched_tokens"] = MAX_NUM_BATCHED_TOKENS
 
         rejected = 0
         for item in stream:
@@ -430,8 +474,6 @@ for concurrency in (8, 64, 87):
             steps += 1
         torch.cuda.synchronize()
         entry["steps_run"] = steps
-        entry["max_batch_width"] = executor.max_batch
-        entry["max_query_len"] = executor.max_query
         entry["running_at_stop"] = len(scheduler.running)
         entry["preemptions"] = len(scheduler.events_of(EventKind.PREEMPT))
         entry["peak_blocks_used"] = max(
@@ -449,6 +491,23 @@ for concurrency in (8, 64, 87):
         print(f"C={concurrency}: {type(error).__name__}: {error}",
               file=sys.stderr, flush=True)
 
+    # ALWAYS, whatever happened. These are the shapes that explain an OOM.
+    try:
+        entry["max_batch_width"] = executor.max_batch
+        entry["max_query_len"] = executor.max_query
+        entry["max_padded_slots"] = executor.max_padded_slots
+        entry["forward_batch_calls"] = executor.calls
+    except NameError:
+        entry["max_batch_width"] = None
+    try:
+        entry["steps_run"] = entry.get("steps_run", steps)
+        entry["preemptions"] = entry.get(
+            "preemptions", len(scheduler.events_of(EventKind.PREEMPT)))
+        entry["peak_blocks_used"] = entry.get("peak_blocks_used", max(
+            (NUM_GPU_BLOCKS - e.free_blocks for e in scheduler.events), default=0))
+    except NameError:
+        pass
+
     entry["peak_allocated_bytes"] = torch.cuda.max_memory_allocated()
     entry["peak_reserved_bytes"] = torch.cuda.max_memory_reserved()
     entry["peak_allocated_gib"] = round(torch.cuda.max_memory_allocated() / 2**30, 3)
@@ -460,7 +519,8 @@ for concurrency in (8, 64, 87):
           f"peak_reserved={entry['peak_reserved_gib']} GiB "
           f"headroom={entry['headroom_gib']} GiB "
           f"max_batch={entry.get('max_batch_width')} "
-          f"max_q={entry.get('max_query_len')}", flush=True)
+          f"max_q={entry.get('max_query_len')} "
+          f"max_padded_slots={entry.get('max_padded_slots')}", flush=True)
     levels[str(concurrency)] = entry
     try:
         del scheduler, executor, cache, allocator
@@ -494,7 +554,8 @@ for rectangle in baseline_mod.RECTANGLE_SIZINGS:
     entry = {"rectangle_tokens": rectangle,
              "max_resident": baseline_mod.max_resident(rectangle)}
     try:
-        observed = baseline_mod.run_baseline(tiny_stream, generator, rectangle)
+        observed = baseline_mod.run_baseline(
+            tiny_stream, generator, rectangle, max_num_seqs=2)
         entry.update({
             "ok": True,
             "num_accepted": observed.num_accepted,

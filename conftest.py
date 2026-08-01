@@ -84,10 +84,24 @@ _PROMPT_PARAMS = ("prompt_len",)
 # fp32_precision strings do not exist at all on older builds. Whatever this host
 # actually had is reported in the header and travels into run metadata.
 #
+# MEASURED, AND STILL UNMEASURED. Session 1 ran fp32 parity on a T4 under three
+# arms -- the host's recorded defaults, pinned ieee, and TF32 forced fully on
+# with float32_matmul_precision='high'. All three came out byte-identical at
+# 3.051758e-05. That does NOT clear the trap. A T4 is sm_75 and TF32 needs
+# Ampere, sm_80 or later, so the tensor cores that would execute it do not
+# exist on that host and the setting had nothing to act on. The locked numbers
+# were derived for a 24 GB A10, which is sm_86 and DOES have TF32.
+#
+# So: the pin is UNMEASURED on Ampere, not shown to be unnecessary. It stays,
+# and it must be re-measured on the first Ampere-or-later host this runs on
+# before anyone calls it insurance.
+#
 # `allow_fp16_reduced_precision_reduction` is read and recorded here but NOT
-# pinned. It governs fp16 split-k reduction, which is the term the fp16 tolerance
-# derivation assumes is negligible -- that is Session 1's experiment to run
-# deliberately, not something to silently change underneath it.
+# pinned by conftest -- bench/run.py pins it for measurement runs so both
+# engines share one setting. Session 1 measured it moving the fp16 deviation by
+# up to 0.75 ulp (length 33: 3.00 -> 2.25 ulp with it off), so the fp16
+# derivation's claim that reduction order is negligible is only partly right.
+# FP16_LOGIT_ATOL is NOT adjusted for it.
 _PRECISION_PROBES = (
     ("torch.backends.cuda.matmul.allow_tf32", "backends.cuda.matmul", "allow_tf32"),
     ("torch.backends.cudnn.allow_tf32", "backends.cudnn", "allow_tf32"),

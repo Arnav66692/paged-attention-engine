@@ -74,6 +74,23 @@ SPREAD_LIMIT = 0.20
 ENGINE_PAGED = "engine"
 ENGINE_BASELINE = "baseline"
 
+# Pinned for both engines, and recorded. Session 1 measured this moving the fp16
+# deviation by up to 0.75 ulp -- length 33 went 3.00 -> 2.25 ulp with it off --
+# so it is not a free knob and the two sides must not differ on it. True is
+# torch's own default; FP16_LOGIT_ATOL is NOT adjusted to suit either setting.
+ALLOW_FP16_REDUCED_PRECISION_REDUCTION = True
+
+
+def pin_fp16_reduction(
+    enabled: bool = ALLOW_FP16_REDUCED_PRECISION_REDUCTION,
+) -> bool:
+    """Force the fp16 split-k reduction setting, so both engines share it."""
+    try:
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = enabled
+    except (AttributeError, RuntimeError):
+        return False
+    return True
+
 
 class InvalidRun(RuntimeError):
     """A run whose result must not be reported. Raised, never logged and ignored."""
@@ -122,14 +139,47 @@ def _model_sha(model_id: str) -> str | None:
         return None
 
 
-def _precision_settings() -> dict:
-    """Whatever precision knobs this torch exposes, by their real names."""
-    try:
-        import conftest
+# Read straight off torch. An earlier version read conftest's globals, which
+# pytest_configure populates -- so outside pytest it returned {} and provenance
+# silently carried no precision settings at all. TF32 has fp16's mantissa; what
+# these were set to is part of what produced a number, and a run launched from
+# the CLI is exactly the run that matters.
+_PRECISION_PROBES = (
+    ("torch.backends.cuda.matmul.allow_tf32", "backends.cuda.matmul", "allow_tf32"),
+    ("torch.backends.cudnn.allow_tf32", "backends.cudnn", "allow_tf32"),
+    ("torch.backends.cuda.matmul.fp32_precision", "backends.cuda.matmul", "fp32_precision"),
+    ("torch.backends.cudnn.fp32_precision", "backends.cudnn", "fp32_precision"),
+    ("torch.backends.cudnn.conv.fp32_precision", "backends.cudnn.conv", "fp32_precision"),
+    ("torch.backends.fp32_precision", "backends", "fp32_precision"),
+    (
+        "torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction",
+        "backends.cuda.matmul",
+        "allow_fp16_reduced_precision_reduction",
+    ),
+)
 
-        return dict(conftest.FP32_PRECISION_PINNED or conftest.FP32_PRECISION_DEFAULTS)
-    except Exception:  # noqa: BLE001 -- provenance never blocks a run
-        return {}
+
+def _precision_settings() -> dict:
+    """Whatever precision knobs this torch exposes, read directly from torch."""
+    observed: dict = {}
+    for label, path, attribute in _PRECISION_PROBES:
+        holder = torch
+        for part in path.split("."):
+            holder = getattr(holder, part, None)
+            if holder is None:
+                break
+        if holder is not None and hasattr(holder, attribute):
+            try:
+                observed[label] = getattr(holder, attribute)
+            except RuntimeError:
+                continue
+    try:
+        observed["torch.get_float32_matmul_precision()"] = (
+            torch.get_float32_matmul_precision()
+        )
+    except (AttributeError, RuntimeError):
+        pass
+    return observed
 
 
 @dataclass(frozen=True)
@@ -302,6 +352,8 @@ def run_engine_pass(
     num_gpu_blocks: int = NUM_GPU_BLOCKS,
     block_size: int = BLOCK_SIZE,
     mode: ExecutionMode = ExecutionMode.FUSED,
+    max_num_seqs: int | None = None,
+    max_num_batched_tokens: int | None = None,
     clock: Callable[[], float] = time.perf_counter,
     synchronize: Callable[[], None] | None = None,
 ) -> EnginePass:
@@ -310,6 +362,8 @@ def run_engine_pass(
     scheduler = Scheduler(
         executor_factory(allocator), allocator, mode=mode,
         admission_margin_blocks=ADMISSION_MARGIN_BLOCKS,
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=max_num_batched_tokens,
     )
 
     rejected = 0

@@ -1186,3 +1186,191 @@ def test_a_step_that_evicts_everything_it_planned_makes_no_call():
     print(f"\nempty batch: {executor.calls - calls_before} calls issued")
     assert executor.calls == calls_before, "an empty batch still issued a forward"
     assert not scheduler._ran
+
+
+# --- capacity caps ----------------------------------------------------------
+#
+# Two caps, the vLLM pattern, both capacity conditions on the same strict-FCFS
+# order. Neither reorders the queue and neither lets anything jump the head.
+#
+# They exist because C never capped anything. Admission was by pool fit alone,
+# so at C=1, 2, 4, 8 and 16 the mixed stream is the same 64 requests, they all
+# fit the 3584-block pool, and all five levels admitted everything -- five
+# identical runs and no low end to the sweep. Worse, the baseline has a hard
+# resident cap of 18 or 32 from its rectangle sizing, so a "C=8" comparison was
+# engine-at-64 against baseline-at-18.
+
+CAP_REQUESTS = [_request(f"c{index}", 8, 12) for index in range(12)]
+
+
+def test_max_num_seqs_bounds_the_running_set():
+    """The running set never exceeds the cap, at any step."""
+    for cap in (1, 2, 4, 8):
+        scheduler, _ = _stub_scheduler(num_blocks=AMPLE_POOL_BLOCKS)
+        scheduler.max_num_seqs = cap
+        for request in CAP_REQUESTS:
+            assert scheduler.add_request(request)
+        widest = 0
+        while scheduler.waiting or scheduler.running:
+            result = scheduler.step()
+            widest = max(widest, result.running)
+            assert result.running <= cap, (
+                f"cap {cap}: {result.running} running at step {result.step}"
+            )
+            assert result.step < 500
+        print(f"\nmax_num_seqs={cap}: widest running set observed {widest}")
+        assert widest == cap, (
+            f"cap {cap} was never actually reached (widest {widest}), so this "
+            "does not demonstrate the cap binds"
+        )
+
+
+def test_without_the_cap_every_low_level_admits_everything():
+    """The bug the cap fixes, pinned so it cannot come back silently."""
+    widths = {}
+    for concurrency in (1, 2, 4, 8, 16):
+        scheduler, _ = _stub_scheduler(num_blocks=AMPLE_POOL_BLOCKS)
+        for request in CAP_REQUESTS:
+            assert scheduler.add_request(request)
+        result = scheduler.step()
+        widths[concurrency] = result.running
+
+    print(f"\nuncapped, running set after step 1 at each C: {widths}")
+    assert len(set(widths.values())) == 1, (
+        "uncapped levels already differ, so this fixture no longer demonstrates "
+        "the collapse"
+    )
+
+    # With the cap set to C they must differ.
+    capped = {}
+    for concurrency in (1, 2, 4, 8, 16):
+        scheduler, _ = _stub_scheduler(num_blocks=AMPLE_POOL_BLOCKS)
+        scheduler.max_num_seqs = concurrency
+        for request in CAP_REQUESTS:
+            assert scheduler.add_request(request)
+        capped[concurrency] = scheduler.step().running
+    print(f"capped at C,  running set after step 1 at each C: {capped}")
+    assert len(set(capped.values())) > 1, "the cap did not separate the levels"
+    assert capped[1] == 1 and capped[2] == 2 and capped[4] == 4
+
+
+def test_max_num_batched_tokens_bounds_the_padded_rectangle():
+    """The cap is on PADDED slots, which is what actually allocates memory.
+
+    A step mixing one long prefill with many single-token decodes costs
+    (rows x longest), not the sum. Bounding the real token count would not bound
+    this engine's memory at all.
+    """
+    scheduler, _ = _stub_scheduler(num_blocks=AMPLE_POOL_BLOCKS, mode=ExecutionMode.FUSED)
+    scheduler.max_num_batched_tokens = 64
+    for request in [_request("long", 48, 6)] + [_request(f"s{i}", 4, 6) for i in range(8)]:
+        assert scheduler.add_request(request)
+
+    costs = []
+    while scheduler.waiting or scheduler.running:
+        result = scheduler.step()
+        costs.append(result.batched_token_cost)
+        assert result.batched_token_cost <= scheduler.max_num_batched_tokens, (
+            f"step {result.step} materialised {result.batched_token_cost} padded "
+            f"slots against a cap of {scheduler.max_num_batched_tokens}"
+        )
+        assert result.step < 500
+    print(f"\npadded cost per step under a 64-slot cap: {costs}")
+    assert max(costs) > 0
+
+
+def test_an_empty_batch_admits_the_head_whatever_its_length():
+    """Otherwise a request longer than the cap could never run at all.
+
+    That is a livelock arriving by a different route than the admission guard's,
+    and it needs the same kind of escape.
+    """
+    scheduler, _ = _stub_scheduler(num_blocks=AMPLE_POOL_BLOCKS, mode=ExecutionMode.FUSED)
+    scheduler.max_num_batched_tokens = 16
+    assert scheduler.add_request(_request("huge", 100, 3))
+
+    outputs = scheduler.run_to_completion(max_steps=200)
+    print(f"\nsequence of 100 tokens under a 16-slot cap: "
+          f"{len(outputs['huge'])} tokens generated")
+    assert len(outputs["huge"]) == 3
+
+
+def test_deferred_decodes_are_not_preemptions():
+    """A decode refused for budget keeps its blocks and runs next step.
+
+    The fixture has to put decodes in flight BEFORE the long prefill arrives.
+    An earlier version admitted the long request first with nothing else
+    running, so the budget never bound and the test proved nothing -- it
+    asserted so, and failed, which is why it is written this way now.
+    """
+    scheduler, allocator = _stub_scheduler(
+        num_blocks=AMPLE_POOL_BLOCKS, mode=ExecutionMode.FUSED)
+    scheduler.max_num_batched_tokens = 120
+
+    for index in range(6):
+        assert scheduler.add_request(_request(f"s{index}", 4, 8))
+    for _ in range(3):
+        scheduler.step()
+    assert len(scheduler.running) == 6, "the short sequences are not in flight"
+
+    # Now a long one arrives. Admitted alone by the empty-batch escape at
+    # 1 x 100 slots; a single decode row would take it to 2 x 100 = 200 > 120.
+    assert scheduler.add_request(_request("long", 100, 4))
+
+    deferred_total = 0
+    while scheduler.waiting or scheduler.running:
+        result = scheduler.step()
+        deferred_total += len(result.deferred)
+        assert result.batched_token_cost <= scheduler.max_num_batched_tokens
+        assert result.step < 500
+
+    print(f"\n{deferred_total} decode(s) deferred for budget; "
+          f"{len(scheduler.events_of(EventKind.PREEMPT))} preemptions")
+    assert deferred_total > 0, "the budget never bound, so this proves nothing"
+    # Deferral is not eviction: nobody lost blocks for it, and nobody lost work.
+    assert not scheduler.events_of(EventKind.PREEMPT), (
+        "a budget deferral was turned into a preemption"
+    )
+    for sequence in scheduler.finished.values():
+        assert len(sequence.generated) == sequence.request.max_new_tokens
+    assert allocator.num_free == AMPLE_POOL_BLOCKS
+
+
+def test_the_headlines_still_preempt_under_the_caps():
+    """Capping at C must not defuse either headline's oversubscription.
+
+    control@C64  = 64 x 64 blocks    = 4096 against 3584
+    mixed@C87    = 87 x 47.26 blocks = 4111 against 3584
+    """
+    from bench import workload
+    from engine.cache import NUM_GPU_BLOCKS
+
+    control = workload.PRESSURE_C * workload.CONTROL_BLOCKS_PER_REQUEST
+    mixed = workload.FRAG_C * workload.MEAN_BLOCKS_PER_REQUEST
+    print(f"\ncontrol@C{workload.PRESSURE_C}: {control} blocks vs {NUM_GPU_BLOCKS}")
+    print(f"mixed@C{workload.FRAG_C}: {int(mixed)} blocks vs {NUM_GPU_BLOCKS}")
+
+    assert control == 4096 and control > NUM_GPU_BLOCKS
+    assert int(mixed) == 4111 and mixed > NUM_GPU_BLOCKS
+
+    # And a capped scheduler really does still evict, on a fixture whose
+    # demand AT THE CAP exceeds the pool -- 8 sequences needing 9 blocks each is
+    # 72 against 64. An earlier version used 5-block sequences, so 8 of them fit
+    # in 64 with room to spare and nothing was ever oversubscribed; it reported
+    # zero preemptions and failed, which is the assertion doing its job.
+    capped_pool, capped_seqs = 64, 8
+    requests = [_request(f"p{i}", 16, 120) for i in range(capped_seqs)]
+    per_request_blocks = -(-requests[0].max_total_len // BLOCK_SIZE)
+    demand = capped_seqs * per_request_blocks
+    print(f"capped fixture: {capped_seqs} x {per_request_blocks} = {demand} blocks "
+          f"vs a {capped_pool}-block pool")
+    assert demand > capped_pool, "the capped fixture is not oversubscribed"
+
+    scheduler, _ = _stub_scheduler(num_blocks=capped_pool, mode=ExecutionMode.FUSED)
+    scheduler.max_num_seqs = capped_seqs
+    for request in requests:
+        assert scheduler.add_request(request)
+    scheduler.run_to_completion(max_steps=20_000)
+    preempts = scheduler.events_of(EventKind.PREEMPT)
+    print(f"capped at {capped_seqs}: {len(preempts)} preemptions")
+    assert preempts, "the cap defused oversubscription entirely"

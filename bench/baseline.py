@@ -161,6 +161,7 @@ class BaselineResult:
 
     rectangle_tokens: int
     max_resident: int
+    max_num_seqs: int | None
     num_offered: int
     num_accepted: int
     num_rejected: int
@@ -190,6 +191,7 @@ class BaselineResult:
         return {
             "rectangle_tokens": self.rectangle_tokens,
             "max_resident": self.max_resident,
+            "max_num_seqs": self.max_num_seqs,
             "num_offered": self.num_offered,
             "num_accepted": self.num_accepted,
             "num_rejected": self.num_rejected,
@@ -278,6 +280,7 @@ def run_baseline(
     rectangle_tokens: int,
     *,
     ceiling_bytes: int = KV_POOL_BYTES,
+    max_num_seqs: int | None = None,
     clock: Callable[[], float] = time.perf_counter,
     synchronize: Callable[[], None] | None = None,
 ) -> BaselineResult:
@@ -289,6 +292,13 @@ def run_baseline(
     naive batching on purpose.
     """
     resident = max_resident(rectangle_tokens, ceiling_bytes)
+    # THE SAME CONCURRENCY CAP THE ENGINE GETS. Without it a sweep at C compares
+    # an engine running whatever fits the pool against a baseline hard-capped at
+    # 18 or 32 by its rectangle -- at C=8 that was engine-at-64 against
+    # baseline-at-18, and no ratio out of that means anything. Both sides now run
+    # at min(their own structural limit, C).
+    if max_num_seqs is not None:
+        resident = min(resident, max_num_seqs)
     accepted, rejected = classify(requests, rectangle_tokens)
 
     batches = [
@@ -313,6 +323,7 @@ def run_baseline(
     return BaselineResult(
         rectangle_tokens=rectangle_tokens,
         max_resident=resident,
+        max_num_seqs=max_num_seqs,
         num_offered=len(requests),
         num_accepted=len(accepted),
         num_rejected=len(rejected),

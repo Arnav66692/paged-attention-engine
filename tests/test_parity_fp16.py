@@ -117,14 +117,24 @@ FP16_MAX = 65504.0
 #      logits reach 2.24e1, measured on the float32 fixtures, which sits in the
 #      binade [16, 32) where one fp16 ulp is 16 * 2**-10 = 1.5625e-2.
 #
-#   2. REDUCTION ORDER IS NOT THE DOMINANT TERM, and this is the finding that
-#      makes the rest of the derivation work. cuBLAS accumulates fp16 GEMMs in
-#      float32 on both a T4 and a P100, and SDPA accumulates its two matmuls in
-#      float32 as well, so reordering them perturbs the result at *float32*
-#      resolution. tests/test_parity.py measures that directly: 2.575e-05
-#      absolute on logits of 2.24e1, or 1.15e-6 relative. That is 1/850th of one
-#      fp16 ulp. It cannot dominate anything, and the two extra mantissa bits do
-#      not help with it either way.
+#   2. REDUCTION ORDER IS NOT THE DOMINANT TERM -- but it is NOT negligible
+#      either, and that correction is measured. cuBLAS accumulates fp16 GEMMs in
+#      float32, so most of the reduction happens at float32 resolution:
+#      tests/test_parity.py measures 2.575e-05 absolute on logits of 2.24e1, or
+#      1.15e-6 relative, 1/850th of one fp16 ulp.
+#
+#      HOWEVER, `allow_fp16_reduced_precision_reduction` defaults to True and
+#      permits fp16 split-k reduction. Session 1 measured both ways on a T4:
+#
+#        prompt_len 13:  3.00 ulp on,  3.00 ulp off   (no change)
+#        prompt_len 32:  2.92 ulp on,  2.75 ulp off
+#        prompt_len 33:  3.00 ulp on,  2.25 ulp off   (0.75 ulp, ~19% of budget)
+#
+#      So the split-k term is worth up to three quarters of an ulp -- a fifth of
+#      the whole 4-ulp budget. The bound below survives because it was derived
+#      pessimistically, not because this term is absent. It is pinned to True,
+#      torch's default, for both engines in bench/run.py, and recorded in
+#      provenance. THE BOUND IS NOT ADJUSTED TO SUIT EITHER SETTING.
 #
 #   3. WHAT fp16 ACTUALLY COSTS is that both implementations round each
 #      operation's output back into fp16 independently. Two values 1.15e-6 apart
