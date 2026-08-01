@@ -12,6 +12,14 @@ a change to the kernel path, so it is held to the strictest bar available: not
 on some device, this fails and the fused/parity tolerances are not asked to
 absorb it.
 
+WHAT THIS FILE DOES NOT SHOW, and what it must not be read as showing. These
+tests pass identical inputs to both paths, so equality here says the EXPANSION
+is exact -- which it is, fp16 into fp16. It says nothing about which kernel SDPA
+picks. On CUDA the switch improved fp16 parity 6x, and that came from SDPA
+dispatching differently for the two input SHAPES, not from the copy. The copy
+cost memory only. `kaggle/session2` identifies the backends; the mechanism note
+lives in `_sdpa`.
+
 The full parity matrix on CUDA is re-verified separately, on the GPU, because
 this file cannot see a device it does not have.
 """

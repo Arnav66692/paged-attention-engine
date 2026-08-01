@@ -159,6 +159,31 @@ _PRECISION_PROBES = (
 )
 
 
+def sdpa_backends_available() -> dict:
+    """Which SDPA backends this build/device can use, and the global toggles.
+
+    Recorded because SDPA backend selection materially moves fp16 numerics --
+    switching to enable_gqa changed the input shape, torch picked a different
+    kernel, and fp16 parity improved 6x with no change to the arithmetic this
+    repo controls. That happened silently and was recorded nowhere. It is
+    recorded now.
+    """
+    observed: dict = {}
+    for name, getter_name in (
+        ("flash", "flash_sdp_enabled"),
+        ("mem_efficient", "mem_efficient_sdp_enabled"),
+        ("math", "math_sdp_enabled"),
+        ("cudnn", "cudnn_sdp_enabled"),
+    ):
+        getter = getattr(torch.backends.cuda, getter_name, None)
+        if callable(getter):
+            try:
+                observed[name] = bool(getter())
+            except RuntimeError:
+                continue
+    return observed
+
+
 def _precision_settings() -> dict:
     """Whatever precision knobs this torch exposes, read directly from torch."""
     observed: dict = {}
@@ -203,6 +228,8 @@ class Provenance:
     visible_cuda_devices: int
     cuda_visible_devices_env: str | None
     fp32_precision: dict
+    sdpa_backends_enabled: dict
+    allocator_conf: dict
 
     @classmethod
     def collect(cls, model_id: str, dtype: str, stream_digest: str) -> "Provenance":
@@ -229,6 +256,15 @@ class Provenance:
             # deviates at fp16 scale, so what these were set to is part of
             # what produced the number.
             fp32_precision=_precision_settings(),
+            # SDPA backend selection moves fp16 numerics. Recorded, because
+            # it moved once already without anyone noticing.
+            sdpa_backends_enabled=sdpa_backends_available(),
+            # expandable_segments changes allocation only, not arithmetic --
+            # but it moves the memory numbers, so it travels with them.
+            allocator_conf={
+                name: os.environ.get(name)
+                for name in ('PYTORCH_ALLOC_CONF', 'PYTORCH_CUDA_ALLOC_CONF')
+            },
         )
 
 

@@ -594,3 +594,35 @@ def test_baseline_takes_the_same_concurrency_cap_as_the_engine():
     )
     # More batches at a tighter cap, same work.
     assert observed[4]["num_batches"] > observed[None]["num_batches"]
+
+
+def test_provenance_records_sdpa_backends_and_allocator_conf():
+    """Two things that move numbers without touching arithmetic.
+
+    SDPA backend selection materially moves fp16 numerics -- the enable_gqa
+    switch changed the input shape, torch picked a different kernel, and fp16
+    parity improved 6x. That happened silently and was recorded nowhere.
+
+    expandable_segments changes allocation only, so it cannot move a logit, but
+    it does move the memory numbers, and a memory number without the allocator
+    setting that produced it is not reproducible.
+    """
+    stream = workload.build_stream("control", seed=0, c=1)
+    provenance = run_mod.Provenance.collect(
+        baseline_mod.BENCH_MODEL, "torch.float16", workload.stream_digest(stream)
+    )
+    print(f"\nsdpa backends: {provenance.sdpa_backends_enabled}")
+    print(f"allocator conf: {provenance.allocator_conf}")
+
+    assert provenance.sdpa_backends_enabled, (
+        "no SDPA backend state recorded; the getter names are wrong again"
+    )
+    assert set(provenance.sdpa_backends_enabled) >= {"flash", "mem_efficient", "math"}
+    assert all(
+        isinstance(value, bool)
+        for value in provenance.sdpa_backends_enabled.values()
+    )
+    # Present as keys even when unset, so "not recorded" and "not set" differ.
+    assert set(provenance.allocator_conf) == {
+        "PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"
+    }

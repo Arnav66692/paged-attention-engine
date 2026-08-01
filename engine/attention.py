@@ -50,9 +50,15 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     kept as the reference the switch was checked against, and because
     `kaggle/session1` uses it to measure what the expansion costs.
 
-    Why it had to go: `expand` is a view, but `reshape` on an expanded tensor
-    cannot be, so it copies. Measured on a T4 at the headline model's 6x GQA
-    ratio (12 query heads, 2 KV heads):
+    THE COPY IS EXACT. It moves fp16 into fp16 and is bit-identical to
+    `repeat_interleave`. It cost memory and nothing else -- in particular it did
+    NOT cost precision, and an earlier version of this docstring claiming
+    otherwise was wrong. The fp16 improvement came from SDPA choosing a different
+    kernel for the different input shape; see `_sdpa` below.
+
+    Why it had to go, then: `expand` is a view, but `reshape` on an expanded
+    tensor cannot be, so it copies. Measured on a T4 at the headline model's 6x
+    GQA ratio (12 query heads, 2 KV heads):
 
         batch 8,  kv_len 3072:  12 MiB source -> +72 MiB copy
         batch 64, kv_len 3072:  96 MiB source -> +576 MiB copy
@@ -111,9 +117,23 @@ def _sdpa(
     `enable_gqa=True` broadcasts them across the query heads inside the kernel.
     The alternative -- `repeat_kv` above -- materialises the expansion, which at
     the headline model's 6x ratio is 1.125 GiB of transient allocation per layer
-    at batch 64 on a 14.56 GiB card. The two are BIT-EXACT: verified equal, not
-    merely close, masked and causal, on cpu and mps, before the switch was made.
-    `tests/test_attention_gqa.py` keeps checking that.
+    at batch 64 on a 14.56 GiB card. Given identical inputs the two produce
+    BIT-EXACT results: verified equal, not merely close, masked and causal, on
+    cpu and mps. `tests/test_attention_gqa.py` keeps checking that.
+
+    AND YET THE SWITCH MOVED fp16 PARITY, 6x better at every prompt length. The
+    reason is NOT that materialising cost precision -- it cannot have. The
+    expansion copies fp16 into fp16 and is bit-exact against repeat_interleave,
+    and the equality test above proves both paths receive identical inputs.
+    What changed is that SDPA DISPATCHES ON INPUT SHAPE: unexpanded K/V with
+    `enable_gqa` and pre-expanded K/V are different shapes, and torch selects a
+    different kernel for them. The numbers moved because the kernel moved.
+
+    That is worth stating plainly because of what it implies. SDPA backend
+    selection materially affects fp16 numerics here, it changed SILENTLY when
+    the input shape changed, and nothing in this repo pinned or recorded it.
+    `bench/run.py` now records which backend runs. See
+    `kaggle/session2` for the measurement that established this.
     """
     return F.scaled_dot_product_attention(
         query,
