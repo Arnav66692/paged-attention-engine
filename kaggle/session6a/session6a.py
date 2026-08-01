@@ -52,7 +52,12 @@ SLICES = {
     "session6c": "mixed-rect3072-C64",
     "session6d": "mixed-rect1757-C64",
 }
-SLICE = Path(__file__).stem
+# DECLARED, NOT DERIVED. Kaggle renames an uploaded script to `script.py`
+# before running it, so `Path(__file__).stem` is "script" on the measurement
+# host and every slice would refuse to start. The four files are otherwise
+# identical copies; this line is the only difference between them, and
+# tests/test_bench.py checks it against the directory it lives in.
+SLICE = "session6a"
 if SLICE not in SLICES:
     raise SystemExit(
         f"{SLICE} is not a known slice. Known: {sorted(SLICES)}. The cell is "

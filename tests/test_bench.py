@@ -663,3 +663,24 @@ def test_every_arm_cell_is_assigned_to_exactly_one_kaggle_slice():
     assert len(assigned) == len(set(assigned)), (
         f"a cell is assigned to two slices and would be measured twice: {assigned}"
     )
+
+    # Each file must DECLARE which slice it is, and declare the right one.
+    # Kaggle renames an uploaded script to script.py, so deriving this from
+    # __file__ made every kernel refuse to start on the measurement host while
+    # working perfectly here. It is a literal now, and a literal can be wrong.
+    declared = {}
+    for candidate in sorted((repo_root / "kaggle").glob("session6?/session6?.py")):
+        for node in ast.walk(ast.parse(candidate.read_text())):
+            if (isinstance(node, ast.Assign)
+                    and getattr(node.targets[0], "id", "") == "SLICE"):
+                declared[candidate.stem] = ast.literal_eval(node.value)
+    assert declared, "no session6 kernel declares a SLICE"
+    for stem, value in declared.items():
+        assert value == stem, (
+            f"kaggle/{stem}/{stem}.py declares SLICE={value!r}. It would measure "
+            f"{slices.get(value)!r} while its name promises {slices.get(stem)!r}, "
+            "and two kernels would silently cover the same cell."
+        )
+    assert set(declared) == set(slices), (
+        f"slice files {sorted(declared)} do not match the table {sorted(slices)}"
+    )
