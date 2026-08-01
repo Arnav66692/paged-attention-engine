@@ -92,42 +92,46 @@ def test_the_list_records_that_the_two_streams_get_different_baseline_kernels():
     )
 
 
-def test_the_kernel_bias_is_recorded_as_unmeasured_and_unsigned():
-    """An asserted direction is worse than an admitted gap.
+def test_the_kernel_bias_carries_its_measurement_and_the_refuted_mechanism():
+    """The bias is MEASURED now. Both halves of that must survive.
 
-    A previous revision of the list claimed the sm_75 headline was an UPPER
-    bound, on the theory that a slow kernel amplifies the baseline's padding
-    waste. That was asserted, not measured, and it ignored the opposing
-    mechanism: in `ratio = (B_e/B_b)(W + B_b·k)/(W + B_e·k)`, raising the
-    per-token cost `k` for both sides drives the ratio toward 1, which would
-    make the same number a FLOOR.
+    First: the result. Arm A and Arm B on `control-rect3072-C64` gave ratio
+    intervals that do not overlap, shifted +2.30%, with the FASTER kernel
+    raising the ratio -- so MATH is a floor on this device.
 
-    Both mechanisms are real. The rectangle sizing does not settle it -- that is
-    a cache allocation and HF masks over the true kv_len -- but static-batch
-    stragglers are genuine wasted per-token work. Sign unknown until the two
-    arms are run.
-
-    This test fails if anyone reintroduces a direction without a measurement.
+    Second, and more easily lost: the mechanism that was asserted and lost.
+    An earlier revision claimed the opposite direction from the straggler
+    argument alone, with no measurement. Deleting that once the answer is known
+    would leave a file that looks like it was right all along, and the next
+    device-dependent question would get the same treatment.
     """
     text = RECHECK.read_text()
-    assert re.search(r"UNKNOWN SIGN|unknown sign", text), (
-        "the list must state that the kernel's effect on the ratio is of "
-        "unknown sign until both arms are measured"
-    )
-    assert re.search(r"UNMEASURED|unmeasured", text), (
-        "the list must state the bias is unmeasured rather than implying a size"
-    )
-    for mechanism in (r"FLOOR|floor", r"CEILING|ceiling"):
-        assert re.search(mechanism, text), (
-            f"the list dropped one of the two opposing mechanisms ({mechanism}); "
-            "keeping only one is how an asserted direction gets back in"
+    for token in ("floor", "2.30%", "0.7702", "0.7880"):
+        assert token in text, (
+            f"the measured kernel-bias result no longer carries {token!r}; a "
+            "direction without its measurement is what this item exists to stop"
         )
-    unhedged = re.search(r"is (?:therefore )?an upper bound", text)
-    assert unhedged is None, (
-        "the list asserts an upper bound again. That direction is exactly what "
-        "arms A and B exist to measure; it may be written down only with the "
-        "measurement that establishes it."
+    assert re.search(r"CEILING|ceiling", text), (
+        "the refuted straggler mechanism was deleted. Keeping only the winner "
+        "makes the file read as though it was never wrong."
     )
+    assert re.search(r"asserted rather than measured|asserted a direction|"
+                     r"asserted direction is worse", text), (
+        "the note that the earlier direction was asserted rather than measured "
+        "is gone; that is the transferable part"
+    )
+
+
+def test_the_list_does_not_assert_a_direction_it_has_not_measured():
+    """Applies to any FUTURE claim, not the one now backed by both arms."""
+    text = RECHECK.read_text()
+    for line in text.splitlines():
+        if re.search(r"is (?:therefore )?an upper bound", line):
+            assert False, (
+                f"an upper bound is asserted again: {line.strip()!r}. The "
+                "measured result is a FLOOR; if a ceiling is being claimed it "
+                "needs the arms re-run, not a sentence."
+            )
 
 
 def test_claude_md_points_at_the_list():
