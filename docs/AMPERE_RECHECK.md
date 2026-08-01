@@ -44,7 +44,7 @@ On the T4, **FLASH_ATTENTION and CUDNN_ATTENTION reject every shape this engine
 issues**, with `"No available kernel"`. That is a property of sm_75, not of this
 code. On Ampere FLASH becomes available and **backend selection moves again**.
 
-Measured on the T4:
+Measured on the T4, engine side:
 
 | path | backend selected |
 |---|---|
@@ -60,12 +60,49 @@ kernel or the Gate 1 comparison is a kernel comparison with paging as a
 confound. `bench/run.py` records `sdpa_backends_enabled`, but *enabled* is not
 *selected* — the selection is shape-dependent.
 
-**To re-measure.** Run `kaggle/session3` Item 1, which intercepts the baseline's
-real SDPA calls and identifies the backend for each. Re-confirm on Ampere that:
+### The baseline side, measured — they MATCH on sm_75
 
-- the engine and the baseline still land on the same backend, and
-- `GQA_PATH` is still the right choice — FLASH may accept `enable_gqa` on sm_80+,
-  which would make the allocation-free path also the fast path and settle it.
+`kaggle/session3` Item 1 intercepted the baseline's **real** SDPA calls during
+`model.generate`: 112 calls across 4 distinct shapes, 2 modules patched. Every
+one of them passed **unexpanded** K/V with `enable_gqa=True`
+(`baseline_expands_kv: false`) and selected `MATH`.
+
+| baseline call | shape | backend |
+|---|---|---|
+| prefill ×28 | q `[4,12,512,128]` k `[4,2,512,128]` causal | `MATH` |
+| decode ×84 | q `[4,12,1,128]` k `[4,2,513…515,128]` | `MATH` |
+
+So HF reaches SDPA exactly the way this engine does. `GQA_PATH="sdpa"` matches
+it; `GQA_PATH="repeat_kv"` does not. **That match, not memory, is why `sdpa` is
+the default** — see item 6, the memory rationale was wrong.
+
+### Symmetry is not neutrality — the bias direction is known and unquantified
+
+`kaggle/session4` timed the two paths on the shapes the engine actually issues:
+
+| shape | `enable_gqa` (MATH) | `repeat_kv` (EFFICIENT) | ratio |
+|---|---|---|---|
+| prefill 8×512 | 9.20 ms | 2.05 ms | 4.48× |
+| decode 64×1024 | 11.62 ms | 4.21 ms | 2.76× |
+| decode 64×2048 | 24.47 ms | 8.78 ms | 2.79× |
+| prefill 16×512 | 14.93 ms | 2.63 ms | 5.67× |
+
+Both sides being on MATH makes the comparison **symmetric**. It does not make it
+**neutral**. MATH is expensive per unit of attention work; the baseline does more
+attention work per useful token because it pads to a rectangle; so a uniformly
+expensive kernel amplifies the baseline's padding waste. **A Gate 1 ratio taken
+on sm_75 is therefore expected to be an upper bound on the paging advantage, not
+an unbiased estimate.** The size of that inflation is **unmeasured** and cannot
+be measured without moving both sides to the same faster kernel.
+
+**To re-measure.** Re-run `kaggle/session3` Item 1 and `kaggle/session4`.
+On Ampere, confirm:
+
+- the engine and the baseline still land on the same backend;
+- whether FLASH accepts `enable_gqa` on sm_80+, which would make the matching
+  path also the fast path and dissolve this entire tradeoff;
+- if they still split, whether the MATH amplification above is large enough that
+  the headline must be qualified or retaken.
 
 ---
 
@@ -101,3 +138,26 @@ measured, not a derived constant. On a 24 GB A10 it is probably conservative.
 
 `max_num_seqs = C` is **not** device-dependent and does not belong on this list —
 it exists so that C means something, and it must stay whatever the card is.
+
+---
+
+## 6. The `enable_gqa` memory saving does not exist on sm_75
+
+`enable_gqa` was adopted to avoid `repeat_kv`'s materialised expansion. That
+expansion is real — 768 MiB at batch 64, kv 2048. What was never measured is
+what the alternative allocates. `kaggle/session4` measured it, and the switch
+costs **3.3–8.3× more** transient memory, not less:
+
+| shape | `enable_gqa` (MATH) | `repeat_kv` (EFFICIENT) |
+|---|---|---|
+| prefill 8×512 | 332.2 MiB | 40.0 MiB |
+| decode 64×1024 | 1283.9 MiB | 384.3 MiB |
+| decode 64×2048 | 2567.0 MiB | 768.4 MiB |
+| prefill 16×512 | 648.1 MiB | 80.0 MiB |
+
+MATH expands K/V for its matmul anyway and materialises the score matrix on top.
+
+**The switch is kept anyway**, for the reason in item 2: it is the path the HF
+baseline takes. **This is device-dependent** — it is a fact about which backend
+`enable_gqa` selects, and on Ampere that selection moves. Re-measure with
+`kaggle/session4` before repeating the memory claim either way.

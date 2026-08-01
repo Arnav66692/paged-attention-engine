@@ -2,15 +2,23 @@
 
 `_sdpa` used to expand K and V to the query head count with `repeat_kv` before
 every attention call. That expansion is a real allocation -- `expand` is a view
-but the `reshape` after it cannot be -- and at the headline model's 6x ratio it
-measured 1.125 GiB of transient per layer at batch 64 on a card with 14.56 GiB
-total and 4.4 GiB already static.
+but the `reshape` after it cannot be.
 
-`enable_gqa=True` makes SDPA broadcast internally and allocate nothing. That is
-a change to the kernel path, so it is held to the strictest bar available: not
-"within a tolerance" but `torch.equal`. If the two ever stop being bit-identical
-on some device, this fails and the fused/parity tolerances are not asked to
-absorb it.
+`enable_gqa=True` makes SDPA broadcast internally instead. That is a change to
+the kernel path, so it is held to the strictest bar available: not "within a
+tolerance" but `torch.equal`. If the two ever stop being bit-identical on some
+device, this fails and the fused/parity tolerances are not asked to absorb it.
+
+THE SWITCH WAS MADE FOR MEMORY AND THAT REASON WAS WRONG. This file measures
+what `repeat_kv` allocates and concluded the switch saved it. It never measured
+what `enable_gqa` allocates instead. `kaggle/session4` did, on the T4, and
+`enable_gqa` costs 3.3-8.3x MORE transient -- 2567 MiB against 768 MiB at batch
+64, kv 2048 -- because MATH expands K/V for its matmul anyway and materialises
+the score matrix on top. It is also 2.76-5.67x slower.
+
+`enable_gqa` is kept regardless, for a reason this file cannot see: it is the
+path the HF baseline takes, measured in `kaggle/session3`. `docs/AMPERE_RECHECK.md`
+items 2 and 6 carry both findings, because both are device-dependent.
 
 WHAT THIS FILE DOES NOT SHOW, and what it must not be read as showing. These
 tests pass identical inputs to both paths, so equality here says the EXPANSION
@@ -104,12 +112,17 @@ def test_enable_gqa_is_bit_identical_to_repeat_kv_when_causal(
     assert torch.equal(expanded, broadcast)
 
 
-def test_repeat_kv_still_materialises_which_is_why_it_left_the_path():
-    """The measurement that motivated the switch, kept runnable.
+def test_repeat_kv_still_materialises_its_expansion():
+    """Half of a comparison, and the half that was mistaken for all of it.
 
-    `repeat_kv` is retained as the reference and as this probe. If it ever stops
-    materialising -- if some future torch makes the reshape a view -- the switch
-    stops being a memory win and that should be visible, not assumed.
+    `repeat_kv` does copy. This test proves it and the size is real: 768 MiB at
+    batch 64, kv 2048 on the headline model. What this test CANNOT see is what
+    `enable_gqa` allocates instead, and for a while that absence was read as
+    zero. It is not zero; it is larger. See the module docstring.
+
+    So this stays, but as a fact about `repeat_kv` alone -- useful because it
+    prices the reference path and would catch a future torch making the reshape
+    a view. It is not evidence for the switch.
     """
     source = torch.zeros((4, 2, 64, 32), dtype=torch.float32)
     expanded = repeat_kv(source, 6)
@@ -122,8 +135,8 @@ def test_repeat_kv_still_materialises_which_is_why_it_left_the_path():
 
     assert expanded.shape == (4, 12, 64, 32)
     assert expanded.data_ptr() != source.data_ptr(), (
-        "repeat_kv no longer copies, so the memory argument for enable_gqa "
-        "needs re-checking rather than assuming"
+        "repeat_kv no longer copies, so the transient cost of the reference "
+        "path has changed and kaggle/session4's comparison needs re-running"
     )
     assert expanded_bytes == source_bytes * 6
 

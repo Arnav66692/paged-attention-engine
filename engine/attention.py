@@ -139,11 +139,27 @@ def _sdpa(
 
     GQA IS SDPA'S JOB, NOT OURS. K and V go in with their own head count and
     `enable_gqa=True` broadcasts them across the query heads inside the kernel.
-    The alternative -- `repeat_kv` above -- materialises the expansion, which at
-    the headline model's 6x ratio is 1.125 GiB of transient allocation per layer
-    at batch 64 on a 14.56 GiB card. Given identical inputs the two produce
-    BIT-EXACT results: verified equal, not merely close, masked and causal, on
-    cpu and mps. `tests/test_attention_gqa.py` keeps checking that.
+    The alternative -- `repeat_kv` above -- materialises the expansion. Given
+    identical inputs the two produce BIT-EXACT results: verified equal, not
+    merely close, masked and causal, on cpu and mps. `tests/test_attention_gqa.py`
+    keeps checking that.
+
+    THE ORIGINAL REASON FOR THIS SWITCH WAS MEMORY, AND THAT REASON IS WRONG.
+    `repeat_kv` does allocate its expansion -- 768 MiB at batch 64, kv 2048,
+    measured, exactly the 2x(64x12x2048x128) fp16 it should be. What was never
+    measured was what the alternative allocates. `kaggle/session4` measured it:
+
+    | shape | enable_gqa (MATH) | repeat_kv (EFFICIENT) |
+    |---|---|---|
+    | prefill 8x512   |  332.2 MiB |  40.0 MiB |
+    | decode 64x1024  | 1283.9 MiB | 384.3 MiB |
+    | decode 64x2048  | 2567.0 MiB | 768.4 MiB |
+    | prefill 16x512  |  648.1 MiB |  80.0 MiB |
+
+    `enable_gqa` costs 3.3-8.3x MORE transient, because MATH expands K/V for its
+    matmul anyway and then materialises the score matrix on top. The saving this
+    switch was made for does not exist on sm_75. It is kept for a different and
+    better reason, below.
 
     AND YET THE SWITCH MOVED fp16 PARITY, 6x better at every prompt length. The
     reason is NOT that materialising cost precision -- it cannot have. The
@@ -158,6 +174,25 @@ def _sdpa(
     the input shape changed, and nothing in this repo pinned or recorded it.
     `bench/run.py` now records which backend runs. See
     `kaggle/session2` for the measurement that established this.
+
+    WHY `sdpa` IS THE DEFAULT, GIVEN THAT IT IS SLOWER AND HEAVIER. Because the
+    HF baseline lands on the same kernel. `kaggle/session3` intercepted the
+    baseline's real SDPA calls during `model.generate` -- 112 of them across 4
+    distinct shapes -- and every one passed unexpanded K/V with `enable_gqa=True`
+    and selected MATH. The engine on `enable_gqa` selects MATH too. They match.
+
+    Switching this engine to `repeat_kv` would buy 2.76-5.67x on the attention
+    call (`kaggle/session4`) and put the engine on EFFICIENT_ATTENTION while the
+    baseline stayed on MATH. That is a 4.5x kernel advantage handed to one side
+    of a comparison that is supposed to be measuring paging. The speed is real
+    and it is not takeable unilaterally.
+
+    Symmetry is not the same as neutrality, and this is the one place to say so:
+    MATH is expensive per unit of attention work, the baseline does more
+    attention work per useful token because it pads, so a uniformly expensive
+    kernel AMPLIFIES the baseline's padding waste. A Gate 1 ratio measured with
+    both sides on MATH is expected to be an UPPER bound on the paging advantage,
+    not an unbiased estimate of it. `docs/AMPERE_RECHECK.md` item 2 carries this.
     """
     if GQA_PATH == "repeat_kv" and num_kv_groups > 1:
         return F.scaled_dot_product_attention(

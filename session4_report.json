@@ -1,0 +1,87 @@
+{
+  "disclaimer": "kernel diagnostic; NOT the Gate 1 throughput number",
+  "device": "Tesla T4",
+  "capability": [
+    7,
+    5
+  ],
+  "shapes": {
+    "fused_prefill_8x512": {
+      "batch": 8,
+      "query_len": 512,
+      "kv_len": 512,
+      "sdpa_enable_gqa": {
+        "seconds_per_call": 0.009202550949999022,
+        "ms_per_call": 9.2026,
+        "peak_transient_mib": 332.2,
+        "ok": true
+      },
+      "repeat_kv": {
+        "seconds_per_call": 0.0020539198499989197,
+        "ms_per_call": 2.0539,
+        "peak_transient_mib": 40.0,
+        "ok": true
+      },
+      "repeat_kv_speedup_vs_sdpa": 4.48
+    },
+    "fused_decode_64x1024": {
+      "batch": 64,
+      "query_len": 1,
+      "kv_len": 1024,
+      "sdpa_enable_gqa": {
+        "seconds_per_call": 0.011619582599996648,
+        "ms_per_call": 11.6196,
+        "peak_transient_mib": 1283.9,
+        "ok": true
+      },
+      "repeat_kv": {
+        "seconds_per_call": 0.004211108900000227,
+        "ms_per_call": 4.2111,
+        "peak_transient_mib": 384.3,
+        "ok": true
+      },
+      "repeat_kv_speedup_vs_sdpa": 2.759
+    },
+    "fused_decode_64x2048": {
+      "batch": 64,
+      "query_len": 1,
+      "kv_len": 2048,
+      "sdpa_enable_gqa": {
+        "seconds_per_call": 0.024467535100001214,
+        "ms_per_call": 24.4675,
+        "peak_transient_mib": 2567.0,
+        "ok": true
+      },
+      "repeat_kv": {
+        "seconds_per_call": 0.008778945150004347,
+        "ms_per_call": 8.7789,
+        "peak_transient_mib": 768.4,
+        "ok": true
+      },
+      "repeat_kv_speedup_vs_sdpa": 2.787
+    },
+    "pressure_prefill_16x512": {
+      "batch": 16,
+      "query_len": 512,
+      "kv_len": 512,
+      "sdpa_enable_gqa": {
+        "seconds_per_call": 0.014932971899997937,
+        "ms_per_call": 14.933,
+        "peak_transient_mib": 648.1,
+        "ok": true
+      },
+      "repeat_kv": {
+        "seconds_per_call": 0.0026325062499950036,
+        "ms_per_call": 2.6325,
+        "peak_transient_mib": 80.0,
+        "ok": true
+      },
+      "repeat_kv_speedup_vs_sdpa": 5.673
+    }
+  },
+  "median_repeat_kv_speedup": 4.48,
+  "range_repeat_kv_speedup": [
+    2.759,
+    5.673
+  ]
+}
