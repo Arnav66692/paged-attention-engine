@@ -88,84 +88,75 @@ the engine that nobody chose and that was invisible until it was measured.
 That is why `sdpa` is the default — it matches on the stream the headline is
 quoted from — and it is **not** a memory saving; see item 6.
 
-### Symmetry is not neutrality — MEASURED on sm_75, and it is a FLOOR
+### Symmetry is not neutrality — MEASURED, and the SIGN IS NOT CONSTANT
 
-**Both arms have been run.** `bench/arms.py`, Kaggle T4, both arms of a cell back
-to back on the same card, 1 warmup + 3 passes, pass spread 0.03–0.17%.
+**Both arms have been run on both deciding cells.** `bench/arms.py`, Kaggle T4,
+both arms of a cell back to back on the same card, 1 warmup + 3 passes, pass
+spread 0.01–0.17%. Only the `control` cells decide this, because only there does
+Arm B move the baseline as well as the engine.
 
-On `control-rect3072-C64` — the cell entitled to decide, because Arm B moves the
-baseline as well as the engine:
+| deciding cell | baseline resident | Arm A (`MATH`) | Arm B (`EFFICIENT`) | shift | overlap |
+|---|---|---|---|---|---|
+| `control-rect3072-C64` | 18 | 0.7699 – **0.7702** – 0.7713 | 0.7862 – **0.7880** – 0.7886 | **+2.30%** | no |
+| `control-rect1757-C64` | 32 | 0.6927 – **0.6928** – 0.6929 | 0.6594 – **0.6598** – 0.6607 | **−4.77%** | no |
 
-| arm | both sides on | engine | baseline | ratio (low–median–high) |
+**The kernel does move the ratio, by at most ~5%, and the SIGN IS NOT A PROPERTY
+OF THE KERNEL — it flips between the two rectangle sizings.** Neither "floor" nor
+"ceiling" is the right word for it. Both arms did provably identical work on both
+cells — same generated tokens, preemptions, peak blocks, rejections and
+`workload_digest`, no provenance drift outside the two knobs — so the shifts are
+attributable to the kernel and the disagreement is real, not noise. The intervals
+are tight enough (≤0.2%) that a 2–5% shift is comfortably resolvable.
+
+**What actually decides the sign: which side gains more from the switch.**
+
+| cell | engine A→B | baseline A→B | winner | ratio moves |
 |---|---|---|---|---|
-| A | `MATH` | 136.95 tok/s | 177.81 tok/s | 0.7699 – **0.7702** – 0.7713 |
-| B | `EFFICIENT_ATTENTION` | 227.62 tok/s | 288.87 tok/s | 0.7862 – **0.7880** – 0.7886 |
+| rect3072 (resident 18) | 1.662× | 1.625× | engine | up |
+| rect1757 (resident 32) | 1.749× | **1.836×** | baseline | down |
 
-**The intervals do not overlap. The shift is +2.30%, and the faster kernel RAISES
-the ratio.** So on this device `MATH` gives a **floor**, not a ceiling. Both arms
-did provably identical work — same generated tokens, preemptions, peak blocks,
-rejections and `workload_digest`, no provenance drift outside the two knobs —
-which is what licenses attributing the shift to the kernel.
+So the kernel switch is **not** a uniform change in a shared per-token cost `k`.
+The two sides issue different shapes — the engine a padded rectangle over a
+~55-sequence running set, the baseline a static batch of 18 or 32 — and
+`EFFICIENT_ATTENTION` rewards those shapes by different factors. At resident 32
+the baseline benefits more than the engine does; at 18 it benefits less.
 
-The mechanism that predicted this is the one about batch amortisation, not the
-one about stragglers: raising the per-token cost `k` on both sides drives
+**This refutes both of the models that were argued from theory.**
 
-```
-ratio = (B_e / B_b) · (W + B_b·k) / (W + B_e·k)
-```
+*Mechanism 1 — batch amortisation.* With `W` the batch-independent per-step
+weight loading, `ratio = (B_e/B_b)(W + B_b·k)/(W + B_e·k)` is monotonically
+**decreasing** in `k` whenever `B_e > B_b`, so it predicts Arm B above Arm A
+**always**. rect3072 agrees; rect1757 contradicts it. The model's flaw is its
+assumption that one `k` serves both sides.
 
-toward 1, so a slower shared kernel *compresses* the advantage. An earlier
-revision of this file asserted the opposite from the straggler argument and
-called the headline an upper bound. **That direction was wrong, and it was
-wrong because it was asserted rather than measured.** The straggler effect is
-real but is evidently the smaller of the two here.
+*Mechanism 2 — static-batch stragglers.* A finished sequence keeps being computed
+until its batch drains, which is real wasted per-token work that a costlier
+kernel makes costlier, predicting Arm B **below** Arm A. rect1757 agrees;
+rect3072 contradicts it. (The rectangle sizing itself was never a candidate — it
+is a KV cache **allocation**, and HF masks over the true `kv_len`.)
 
-**+2.30% is the size of the whole question.** It is resolvable only because the
-pass spread is two orders of magnitude tighter than the escalation limit.
+Both effects are real and neither dominates universally. An earlier revision of
+this file asserted mechanism 2 alone and called the headline an upper bound;
+a later one, after only the first cell had run, called it a floor. **Both were
+wrong, and wrong the same way: a direction stated from less evidence than the
+question needed.** The transferable lesson is not which mechanism wins — nothing
+wins — but that the sign here is a property of the *configuration* and has to be
+measured per cell.
+
+**Consequence for the headline.** The kernel contributes a bounded ±5% that
+cannot be signed a priori, so it must be quoted with the arm and the rectangle it
+came from. It is not a hedge to be waved at; it is a measured term.
 
 **The `mixed` cells decide nothing about this** and must not be read as if they
 did. There HF's ragged batches already pre-expand, so Arm B's patch is inert on
-the baseline — measured, not assumed: baseline 1249.92 s vs 1250.45 s across the
-arms, 0.04% apart. Only the engine moves, and it moves 2.01×. That number prices
-the handicap Arm A was carrying, not kernel bias.
+the baseline — measured rather than assumed: baseline 1249.92 s vs 1250.45 s
+across the arms, 0.04% apart. Only the engine moves, and it moves 2.01×. That
+prices the handicap Arm A was carrying, not kernel bias.
 
-`kaggle/session4` timed the two paths on the shapes the engine actually issues:
-
-| shape | `enable_gqa` (MATH) | `repeat_kv` (EFFICIENT) | ratio |
-|---|---|---|---|
-| prefill 8×512 | 9.20 ms | 2.05 ms | 4.48× |
-| decode 64×1024 | 11.62 ms | 4.21 ms | 2.76× |
-| decode 64×2048 | 24.47 ms | 8.78 ms | 2.79× |
-| prefill 16×512 | 14.93 ms | 2.63 ms | 5.67× |
-
-**Why the two mechanisms, and which won.** Two effects were in play and they
-pull opposite ways, which is why this had to be run rather than reasoned out.
-
-**Mechanism 1 — a slow shared kernel shrinks the ratio (MATH is a FLOOR).** With
-`W` the batch-independent per-step weight loading, `k` the per-token cost, and
-`B_e`/`B_b` the two batch sizes, `ratio = (B_e/B_b)(W + B_b·k)/(W + B_e·k)`
-falls toward 1 as `k` rises. The engine's advantage comes from amortising `W`
-over a larger batch, so anything making per-token work dominate `W` erodes it.
-**This is the one that won**, by +2.30%.
-
-**Mechanism 2 — a slow shared kernel inflates the ratio (MATH would be a
-CEILING).** This needs the baseline to do more attention work *per useful token*.
-Rectangle sizing does **not** do that — it is a KV cache **allocation**, and HF
-masks over the true `kv_len`. Static-batch **stragglers** do: a finished sequence
-keeps being computed until its whole batch drains. Real, but evidently smaller
-than mechanism 1 here.
-
-An earlier revision of this file asserted mechanism 2, ignored mechanism 1
-entirely, and labelled the headline an upper bound. It was wrong, and it was
-wrong in the specific way this file exists to prevent: **an asserted direction is
-worse than an admitted gap.** The gap is now closed by measurement, and the sign
-is the opposite of the one that was asserted.
-
-**The procedure, kept runnable.** `python -m bench.arms` runs both arms; `--compare-only`
-joins slices measured in separate sessions. Arm B is **void unless** the patched
-baseline is token-identical to the unpatched one, and cells whose two arms did
-different work are refused rather than compared.
-
+**The procedure, kept runnable.** `python -m bench.arms` runs both arms;
+`--compare-only` joins slices measured in separate sessions. Arm B is **void
+unless** the patched baseline is token-identical to the unpatched one, and cells
+whose two arms did different work are refused rather than compared.
 
 **To re-measure.** Re-run `kaggle/session3` Item 1 and `kaggle/session4`.
 On Ampere, confirm:

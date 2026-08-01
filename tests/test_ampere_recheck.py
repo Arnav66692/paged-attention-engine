@@ -92,33 +92,41 @@ def test_the_list_records_that_the_two_streams_get_different_baseline_kernels():
     )
 
 
-def test_the_kernel_bias_carries_its_measurement_and_the_refuted_mechanism():
-    """The bias is MEASURED now. Both halves of that must survive.
+def test_the_kernel_bias_carries_both_cells_and_both_refuted_mechanisms():
+    """The bias is measured on both deciding cells, and they DISAGREE IN SIGN.
 
-    First: the result. Arm A and Arm B on `control-rect3072-C64` gave ratio
-    intervals that do not overlap, shifted +2.30%, with the FASTER kernel
-    raising the ratio -- so MATH is a floor on this device.
+    control-rect3072 (baseline resident 18) shifted +2.30%; control-rect1757
+    (resident 32) shifted -4.77%. Both intervals non-overlapping, both arms
+    doing provably identical work. So the sign is a property of the
+    CONFIGURATION, not of the kernel, and neither theoretical model survives:
+    batch amortisation predicts Arm B above Arm A always, stragglers predict
+    below always, and each is contradicted by one cell.
 
-    Second, and more easily lost: the mechanism that was asserted and lost.
-    An earlier revision claimed the opposite direction from the straggler
-    argument alone, with no measurement. Deleting that once the answer is known
-    would leave a file that looks like it was right all along, and the next
-    device-dependent question would get the same treatment.
+    A summary keeping only one cell would restore exactly the mistake this
+    entry has now made twice -- first "upper bound" from the straggler argument,
+    then "floor" after only the first cell had run.
     """
     text = RECHECK.read_text()
-    for token in ("floor", "2.30%", "0.7702", "0.7880"):
+    # Normalise the Unicode minus the markdown tables use, so the check is
+    # about the NUMBER surviving, not which dash character was typed.
+    text = text.replace("\u2212", "-")
+    for token in ("+2.30%", "-4.77%", "0.7702", "0.7880", "0.6928", "0.6598"):
         assert token in text, (
-            f"the measured kernel-bias result no longer carries {token!r}; a "
-            "direction without its measurement is what this item exists to stop"
+            f"the measured kernel-bias result no longer carries {token!r}. "
+            "Both deciding cells must stay, or the file reads as though the "
+            "sign were settled."
         )
-    assert re.search(r"CEILING|ceiling", text), (
-        "the refuted straggler mechanism was deleted. Keeping only the winner "
-        "makes the file read as though it was never wrong."
+    assert re.search(r"SIGN IS NOT CONSTANT|sign is not constant|"
+                     r"SIGN IS NOT A PROPERTY OF THE KERNEL", text), (
+        "the list no longer says the sign is not constant across cells, which "
+        "is the actual finding"
     )
-    assert re.search(r"asserted rather than measured|asserted a direction|"
-                     r"asserted direction is worse", text), (
-        "the note that the earlier direction was asserted rather than measured "
-        "is gone; that is the transferable part"
+    # Both mechanisms must survive, including the one that lost in each cell.
+    assert re.search(r"[Bb]atch amortisation", text), "mechanism 1 deleted"
+    assert re.search(r"stragglers", text), "mechanism 2 deleted"
+    assert re.search(r"[Bb]oth were wrong|refutes both|neither dominates", text), (
+        "the record that BOTH asserted directions were wrong is gone; that is "
+        "the transferable part, not which mechanism won"
     )
 
 
