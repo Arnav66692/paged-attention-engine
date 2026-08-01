@@ -428,7 +428,17 @@ def test_sweep_runs_end_to_end_on_the_stub_scale(tmp_path):
     def cache_factory(allocator):
         return engine.new_paged_cache(allocator.num_blocks, allocator.block_size)
 
-    def engine_factory(stream):
+    # What the sweep hands the factory. Captured rather than ignored: the caps
+    # existed on run_engine_pass and were passed by nobody, so the sweep ran the
+    # engine uncapped and OOM'd on the measurement host at 13.86 of 14.56 GiB
+    # before producing one timing. A stub that shrugs off its arguments is how a
+    # missing argument survives a green suite.
+    handed: dict = {}
+
+    def engine_factory(stream, max_num_seqs, max_num_batched_tokens):
+        handed["max_num_seqs"] = max_num_seqs
+        handed["max_num_batched_tokens"] = max_num_batched_tokens
+
         def run_pass():
             def executor_factory(allocator):
                 from engine.scheduler import Qwen2Executor
@@ -438,6 +448,8 @@ def test_sweep_runs_end_to_end_on_the_stub_scale(tmp_path):
             return run_mod.run_engine_pass(
                 stream, executor_factory, num_gpu_blocks=pool_blocks,
                 mode=ExecutionMode.FUSED,
+                max_num_seqs=max_num_seqs,
+                max_num_batched_tokens=max_num_batched_tokens,
             )
 
         return run_pass
@@ -454,6 +466,18 @@ def test_sweep_runs_end_to_end_on_the_stub_scale(tmp_path):
         )
     finally:
         workload.build_stream = original
+
+    assert handed.get("max_num_seqs") == 1, (
+        f"the sweep handed max_num_seqs={handed.get('max_num_seqs')!r} at C=1. "
+        "It must pass the level, or C means nothing and the engine runs at "
+        "whatever fits the pool while the baseline is capped by its rectangle."
+    )
+    assert handed.get("max_num_batched_tokens") == run_mod.MAX_NUM_BATCHED_TOKENS, (
+        f"the sweep handed max_num_batched_tokens="
+        f"{handed.get('max_num_batched_tokens')!r}. Unset, the fused step's "
+        "padded rectangle is unbounded -- 102 sequences x 1969 tokens on the "
+        "mixed stream, which is how this OOM'd on a T4."
+    )
 
     assert len(results) == 1
     level = results[0]

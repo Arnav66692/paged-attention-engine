@@ -75,6 +75,26 @@ SPREAD_LIMIT = 0.20
 ENGINE_PAGED = "engine"
 ENGINE_BASELINE = "baseline"
 
+# THE TWO CAPACITY CAPS, APPLIED TO THE SWEEP.
+#
+# These existed in the scheduler and in kaggle/session2 and were NOT reaching
+# this file: `run_engine_pass` accepted both, `_engine_factory` passed neither,
+# and `_baseline_factory` passed no `max_num_seqs` either. The sweep therefore
+# ran the engine UNCAPPED -- the configuration session 2 measured OOMing at
+# 131,072 padded slots -- and it did OOM, on the mixed stream, at 13.86 GiB of
+# 14.56 GiB, before producing a single timing. A capped run is not a tuning
+# preference here; the uncapped one does not complete.
+#
+# max_num_seqs = C. Not device-dependent. It exists so that C means something:
+# without it a sweep at C=8 compared an engine running whatever fits the pool
+# against a baseline hard-capped by its rectangle. Both sides run at
+# min(their own structural limit, C).
+#
+# max_num_batched_tokens = 8192. EMPIRICAL, measured on a T4 in kaggle/session2,
+# not derived. It is the padded-rectangle budget for one fused step. On a larger
+# card it is probably conservative -- docs/AMPERE_RECHECK.md item 5.
+MAX_NUM_BATCHED_TOKENS = 8192
+
 # Pinned for both engines, and recorded. Session 1 measured this moving the fp16
 # deviation by up to 0.75 ulp -- length 33 went 3.00 -> 2.25 ulp with it off --
 # so it is not a free knob and the two sides must not differ on it. True is
@@ -236,11 +256,17 @@ class Provenance:
     # a ratio is only interpretable next to them.
     gqa_path: str
     baseline_kv_expansion_forced: bool
+    max_num_batched_tokens: int | None
+    # Whether the UNPATCHED baseline pre-expands K/V on this cell's own stream.
+    # Decides whether Arm B moved the baseline or only the engine, which decides
+    # which question this cell's A-vs-B comparison answers.
+    baseline_expands_kv_unpatched: bool | None
 
     @classmethod
     def collect(
         cls, model_id: str, dtype: str, stream_digest: str,
         *, baseline_kv_expansion_forced: bool = False,
+        baseline_expands_kv_unpatched: bool | None = None,
     ) -> "Provenance":
         return cls(
             num_gpu_blocks=NUM_GPU_BLOCKS,
@@ -278,6 +304,8 @@ class Provenance:
             # what the kernel calls actually obeyed.
             gqa_path=attention_mod.GQA_PATH,
             baseline_kv_expansion_forced=baseline_kv_expansion_forced,
+            max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
+            baseline_expands_kv_unpatched=baseline_expands_kv_unpatched,
         )
 
 
@@ -492,21 +520,60 @@ def check_control_headline_level(stream_name: str, concurrency: int, headline: b
         )
 
 
-def check_preemptions(result: LevelResult, demanded_blocks: int) -> None:
-    """GUARD: a C64 run with no preemptions is INVALID.
+def forced_eviction_demand(stream: Sequence, max_num_seqs: int | None) -> int:
+    """Blocks the SMALLEST admissible resident set needs. Eviction is certain
+    above the pool and merely possible below it.
 
-    Raised for two situations that are the same mistake seen from different
-    sides: the control stream at PRESSURE_C, where the 12.5% shortfall forces
-    eviction arithmetically, and any level whose realized demand exceeds the
-    pool at all. Either way, zero preemptions means the pool was mis-sized, the
-    stream was not consumed, or the scheduler never ran -- and the throughput
-    number is then measuring something else.
+    `realized_block_demand` sums the WHOLE stream, which is the wrong quantity
+    once `max_num_seqs` exists: only `max_num_seqs` requests are ever resident,
+    so a 256-request stream demanding 12,184 blocks says nothing about whether
+    64 of them at a time overflow a 3584-block pool. Taking the smallest
+    `max_num_seqs` requests makes this a lower bound on any resident set, so
+    exceeding the pool means eviction regardless of admission order.
+
+    Measured at C=64: control 4096 (forced, every request is 64 blocks); mixed
+    1226 from the smallest 64 and 3310 from the first 64, both under the pool,
+    though the largest 64 would want 5766. So the mixed stream MAY preempt and
+    is not required to, and a mixed run recording zero preemptions is a fact
+    about the stream rather than a broken harness.
+    """
+    if not stream:
+        return 0
+    per_request = sorted(
+        -(-(len(item.prompt_token_ids) + item.max_new_tokens) // BLOCK_SIZE)
+        for item in stream
+    )
+    resident = len(per_request) if max_num_seqs is None else min(max_num_seqs, len(per_request))
+    return sum(per_request[:resident])
+
+
+def check_preemptions(
+    result: LevelResult, demanded_blocks: int, forced_demand: int | None = None
+) -> None:
+    """GUARD: a run with no preemptions where eviction is FORCED is INVALID.
+
+    Two situations, the same mistake from different sides: the control stream at
+    PRESSURE_C, where the 12.5% shortfall forces eviction arithmetically, and
+    any level whose smallest resident set already overflows the pool. Either
+    way zero preemptions means the pool was mis-sized, the stream was not
+    consumed, or the scheduler never ran, and the throughput number is measuring
+    something else.
+
+    THE PREDICATE WAS WRONG AND THIS NARROWS IT. It used to test whole-stream
+    demand against the pool, which is true for essentially every stream and
+    would have raised `InvalidRun` on the mixed cells the moment `max_num_seqs`
+    started being applied -- flagging a legitimate zero-preemption run as
+    broken. Narrowing a guard is not free and is not done to make a cell pass:
+    the control headline's own check is UNCONDITIONAL at PRESSURE_C and is
+    untouched, so the quotable number keeps exactly the protection it had.
     """
     if result.engine != ENGINE_PAGED or result.preemption_count > 0:
         return
 
     at_pressure = result.stream == "control" and result.concurrency == PRESSURE_C
-    oversubscribed = demanded_blocks > NUM_GPU_BLOCKS
+    oversubscribed = (
+        forced_demand if forced_demand is not None else demanded_blocks
+    ) > NUM_GPU_BLOCKS
     if not (at_pressure or oversubscribed):
         return
 
@@ -619,13 +686,16 @@ def sweep(
         check_control_headline_level(stream_name, concurrency, headline)
         stream = workload.build_stream(stream_name, seed, concurrency)
         demanded = realized_block_demand(stream)
+        forced = forced_eviction_demand(stream, concurrency)
         log(f"C={concurrency}: {len(stream)} requests, "
-            f"realized block demand {demanded} vs pool {NUM_GPU_BLOCKS}")
+            f"realized block demand {demanded} vs pool {NUM_GPU_BLOCKS}; "
+            f"smallest resident set at C={concurrency} needs {forced} blocks, so "
+            f"eviction is {'FORCED' if forced > NUM_GPU_BLOCKS else 'possible but not forced'}")
 
         if engine_pass_factory is not None:
             level = measure_level(
                 ENGINE_PAGED, stream_name, concurrency, stream,
-                engine_pass_factory(stream),
+                engine_pass_factory(stream, concurrency, MAX_NUM_BATCHED_TOKENS),
                 throughput_valid=throughput_valid, log=log,
             )
             level.demanded_blocks = demanded
@@ -633,15 +703,20 @@ def sweep(
                 log(f"    pool trace downsampled: {len(level.pool_trace)} of "
                     f"{level.trace_events_total} events kept (stride sampling, "
                     f"cap {MAX_TRACE_POINTS})")
-            check_preemptions(level, demanded)
+            check_preemptions(
+                level, demanded,
+                forced_eviction_demand(stream, concurrency),
+            )
             results.append(level)
 
         if baseline_pass_factory is not None and rectangle_tokens is not None:
             level = measure_level(
                 ENGINE_BASELINE, stream_name, concurrency, stream,
-                baseline_pass_factory(stream, rectangle_tokens),
+                baseline_pass_factory(stream, rectangle_tokens, concurrency),
                 rectangle_tokens=rectangle_tokens,
-                max_resident=baseline_mod.max_resident(rectangle_tokens),
+                max_resident=min(
+                    baseline_mod.max_resident(rectangle_tokens), concurrency
+                ),
                 throughput_valid=throughput_valid, log=log,
             )
             level.demanded_blocks = demanded
@@ -694,14 +769,16 @@ def _cuda_sync() -> None:
 
 
 def _engine_factory(engine, cache_factory):
-    def factory(stream):
+    def factory(stream, max_num_seqs, max_num_batched_tokens):
         def run_pass() -> EnginePass:
             def executor_factory(allocator):
                 cache = cache_factory(allocator)
                 return Qwen2Executor(engine, cache, allocator)
 
             return run_engine_pass(
-                stream, executor_factory, synchronize=_cuda_sync
+                stream, executor_factory, synchronize=_cuda_sync,
+                max_num_seqs=max_num_seqs,
+                max_num_batched_tokens=max_num_batched_tokens,
             )
 
         return run_pass
@@ -710,10 +787,11 @@ def _engine_factory(engine, cache_factory):
 
 
 def _baseline_factory(generator):
-    def factory(stream, rectangle_tokens):
+    def factory(stream, rectangle_tokens, max_num_seqs):
         def run_pass() -> EnginePass:
             observed = baseline_mod.run_baseline(
-                stream, generator, rectangle_tokens, synchronize=_cuda_sync
+                stream, generator, rectangle_tokens, synchronize=_cuda_sync,
+                max_num_seqs=max_num_seqs,
             )
             return EnginePass(
                 elapsed=observed.elapsed_seconds,
@@ -797,16 +875,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     # the real stream's own batches, and on a prompt-uniform batch specifically,
     # because that is the case where the patch actually changes HF's behaviour
     # (ragged batches already pre-expand, so the patch is inert there).
+    # WHICH PATH THE UNPATCHED BASELINE TAKES ON THIS CELL'S OWN STREAM,
+    # measured for BOTH arms and recorded. Arm B's patch only bites where HF
+    # would otherwise have used `enable_gqa`, i.e. where the batch is
+    # prompt-uniform and the mask collapses to None. On a ragged stream HF
+    # already pre-expands and the patch is INERT. Without this per cell, a cell
+    # where the patch flipped the kernel looks identical in the result file to
+    # one where it did nothing -- and those two answer different questions.
+    probe_batch = list(reference[: baseline_mod.max_resident(args.rectangle)])[:4]
+    baseline_expands_unpatched = baseline_mod.baseline_expands_kv_for(
+        generator, probe_batch
+    )
+    print(f"unpatched baseline on {args.stream}: "
+          f"expands_kv={baseline_expands_unpatched} "
+          f"({'already on the pre-expanded path; Arm B is inert here' if baseline_expands_unpatched else 'takes enable_gqa; Arm B moves it'})")
+
     baseline_identity = None
     if args.baseline_expand_kv:
-        probe_batch = list(reference[: baseline_mod.max_resident(args.rectangle)])
-        control_batch = list(
-            workload.build_stream("control", args.seed, concurrencies[0])[:4]
-        )
+        # Probe the batch the timed pass actually runs. Where the patch is inert
+        # on this stream, that batch proves nothing, so borrow a prompt-uniform
+        # one -- the case where the patch does flip the path -- rather than
+        # comparing the same requests twice and reporting double the evidence.
+        batches = [probe_batch]
+        if baseline_expands_unpatched:
+            batches.append(
+                list(workload.build_stream("control", args.seed, concurrencies[0])[:4])
+            )
         print("Arm B prerequisite: patched baseline vs unpatched, token identity")
-        baseline_identity = baseline_mod.assert_token_identical(
-            generator, [probe_batch[:4], control_batch]
-        )
+        baseline_identity = baseline_mod.assert_token_identical(generator, batches)
         print(f"  {baseline_identity}")
         baseline_mod.force_baseline_kv_expansion()
         print("  patch applied for the timed passes")
@@ -814,6 +910,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     provenance = Provenance.collect(
         args.model, str(dtype), workload.stream_digest(reference),
         baseline_kv_expansion_forced=args.baseline_expand_kv,
+        baseline_expands_kv_unpatched=baseline_expands_unpatched,
     )
 
     results = sweep(

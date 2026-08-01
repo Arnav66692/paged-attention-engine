@@ -194,6 +194,9 @@ def ratio_for(payload: dict) -> dict | None:
     b_lo, b_med, b_hi = b_bounds
     return {
         "resolved": True,
+        # Did Arm B move the BASELINE on this cell, or only the engine?
+        "baseline_expands_kv_unpatched": provenance.get("baseline_expands_kv_unpatched"),
+        "gqa_path": provenance.get("gqa_path"),
         "engine_tps": {"low": e_lo, "median": e_med, "high": e_hi},
         "baseline_tps": {"low": b_lo, "median": b_med, "high": b_hi},
         # Worst case for the engine over best case for the baseline, and back.
@@ -205,12 +208,49 @@ def ratio_for(payload: dict) -> dict | None:
     }
 
 
+# What an A-vs-B comparison MEANS depends on whether Arm B moved the baseline.
+#
+# Arm B's patch only bites where HF would otherwise have taken `enable_gqa`,
+# which is only where the batch is prompt-uniform. So the cells are not four
+# replicates of one contrast, and pooling them into a single verdict would be
+# wrong:
+#
+#   BOTH SIDES MOVED (control: baseline enable_gqa/MATH -> pre-expanded/
+#     EFFICIENT, engine likewise). Arm A and Arm B are each internally
+#     symmetric, and they differ only in WHICH shared kernel both sides ran.
+#     THIS IS THE KERNEL-BIAS QUESTION and only these cells answer it.
+#
+#   ONLY THE ENGINE MOVED (mixed: HF's ragged batches already pre-expand, so
+#     the patch is inert and the baseline runs byte-identical code in both
+#     arms). Arm A is ASYMMETRIC -- engine on MATH, baseline already on
+#     EFFICIENT -- and Arm B removes that. The A-to-B shift here is a one-sided
+#     engine speedup, and it necessarily raises the ratio. Reading it as
+#     evidence about kernel bias would be reading a known handicap being lifted.
+#     It is still worth reporting: it prices what the unintended asymmetry cost.
+BOTH_MOVED = "both_sides_moved"
+ONLY_ENGINE_MOVED = "only_engine_moved"
+UNKNOWN_MOVE = "unrecorded"
+
+
+def _classify(arm_a: dict) -> str:
+    """Which question this cell answers, from Arm A's measured baseline path."""
+    expands = arm_a.get("baseline_expands_kv_unpatched")
+    if expands is None:
+        return UNKNOWN_MOVE
+    return ONLY_ENGINE_MOVED if expands else BOTH_MOVED
+
+
 def compare_arms(arm_a: dict, arm_b: dict) -> dict:
     """Do the two arms agree, cell by cell? Overlap of the ratio intervals.
 
     Overlap is the honest test. Two point medians will essentially never be
     equal, and calling a 3% gap a 'difference' when each arm's own passes span
     8% would be reading noise as signal.
+
+    The verdict on kernel bias is drawn ONLY from cells where both sides moved.
+    See the note above: cells where the patch was inert on the baseline measure
+    something else, and averaging the two would let a lifted handicap masquerade
+    as a kernel effect.
     """
     cells = {}
     for name in sorted(set(arm_a) | set(arm_b)):
@@ -220,8 +260,11 @@ def compare_arms(arm_a: dict, arm_b: dict) -> dict:
                            "why": "one or both arms did not resolve this cell"}
             continue
         overlap = a["ratio_low"] <= b["ratio_high"] and b["ratio_low"] <= a["ratio_high"]
+        kind = _classify(a)
         cells[name] = {
             "comparable": True,
+            "kind": kind,
+            "answers_kernel_bias": kind == BOTH_MOVED,
             "arm_a_ratio": [a["ratio_low"], a["ratio_median"], a["ratio_high"]],
             "arm_b_ratio": [b["ratio_low"], b["ratio_median"], b["ratio_high"]],
             "intervals_overlap": overlap,
@@ -231,21 +274,46 @@ def compare_arms(arm_a: dict, arm_b: dict) -> dict:
                 else ("faster kernel RAISES the ratio (MATH was a floor)"
                       if b["ratio_median"] > a["ratio_median"]
                       else "faster kernel LOWERS the ratio (MATH was a ceiling)")
+            ) if kind == BOTH_MOVED else (
+                "Arm A was asymmetric here (engine MATH, baseline already "
+                "EFFICIENT); this shift is that handicap being lifted, not "
+                "kernel bias"
             ),
         }
+
     comparable = [c for c in cells.values() if c.get("comparable")]
+    deciding = [c for c in comparable if c["kind"] == BOTH_MOVED]
+    asymmetry = [c for c in comparable if c["kind"] == ONLY_ENGINE_MOVED]
+    unknown = [c for c in comparable if c["kind"] == UNKNOWN_MOVE]
+
+    agree = bool(deciding) and all(c["intervals_overlap"] for c in deciding)
     return {
         "cells": cells,
-        "all_comparable_cells_agree": bool(comparable) and all(
-            c["intervals_overlap"] for c in comparable
-        ),
         "num_comparable": len(comparable),
-        "verdict": (
-            "UNDETERMINED -- no cell resolved in both arms" if not comparable
-            else "kernel choice does not bias the ratio at this resolution"
-            if all(c["intervals_overlap"] for c in comparable)
-            else "kernel choice DOES move the ratio; see per-cell direction"
-        ),
+        "num_deciding": len(deciding),
+        "kernel_bias": {
+            "from_cells": [n for n, c in cells.items()
+                           if c.get("kind") == BOTH_MOVED],
+            "all_agree": agree,
+            "verdict": (
+                "UNDETERMINED -- no cell where BOTH sides changed kernel "
+                "resolved in both arms" if not deciding
+                else "kernel choice does not bias the ratio at this resolution"
+                if agree
+                else "kernel choice DOES move the ratio; see per-cell direction"
+            ),
+        },
+        "asymmetry_cost": {
+            "from_cells": [n for n, c in cells.items()
+                           if c.get("kind") == ONLY_ENGINE_MOVED],
+            "note": (
+                "Arm A ran the engine on MATH against a baseline already on "
+                "EFFICIENT_ATTENTION. These shifts price that handicap; they "
+                "are NOT evidence about kernel bias."
+            ),
+            "median_shift_b_over_a": [c["median_shift_b_over_a"] for c in asymmetry],
+        },
+        "cells_with_unrecorded_baseline_path": len(unknown),
     }
 
 

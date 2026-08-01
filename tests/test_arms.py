@@ -94,9 +94,11 @@ def test_a_smoke_run_cannot_contribute_a_ratio():
 # --- the comparison --------------------------------------------------------
 
 
-def _ratio(low, median, high):
+def _ratio(low, median, high, *, baseline_expands=False):
+    """`baseline_expands=False` = the control case, where Arm B moves BOTH sides
+    and the cell therefore answers the kernel-bias question."""
     return {"resolved": True, "ratio_low": low, "ratio_median": median,
-            "ratio_high": high}
+            "ratio_high": high, "baseline_expands_kv_unpatched": baseline_expands}
 
 
 def test_overlapping_intervals_are_called_agreement_not_a_difference():
@@ -106,8 +108,8 @@ def test_overlapping_intervals_are_called_agreement_not_a_difference():
         {"cell": _ratio(2.0, 2.06, 2.2)},
     )
     assert comparison["cells"]["cell"]["intervals_overlap"] is True
-    assert comparison["all_comparable_cells_agree"] is True
-    assert "does not bias" in comparison["verdict"]
+    assert comparison["kernel_bias"]["all_agree"] is True
+    assert "does not bias" in comparison["kernel_bias"]["verdict"]
 
 
 def test_disjoint_intervals_report_the_direction_of_the_shift():
@@ -120,7 +122,7 @@ def test_disjoint_intervals_report_the_direction_of_the_shift():
     assert cell["intervals_overlap"] is False
     assert "floor" in cell["direction"]
     assert cell["median_shift_b_over_a"] == pytest.approx(1.6)
-    assert "DOES move" in comparison["verdict"]
+    assert "DOES move" in comparison["kernel_bias"]["verdict"]
 
 
 def test_the_other_direction_is_reported_as_a_ceiling():
@@ -136,7 +138,7 @@ def test_one_cell_disagreeing_is_enough_to_deny_blanket_agreement():
         {"a": _ratio(1.9, 2.0, 2.1), "b": _ratio(1.9, 2.0, 2.1)},
         {"a": _ratio(1.9, 2.0, 2.1), "b": _ratio(5.0, 5.2, 5.4)},
     )
-    assert comparison["all_comparable_cells_agree"] is False
+    assert comparison["kernel_bias"]["all_agree"] is False
 
 
 def test_no_comparable_cell_is_undetermined_and_never_agreement():
@@ -144,9 +146,9 @@ def test_no_comparable_cell_is_undetermined_and_never_agreement():
     comparison = arms.compare_arms(
         {"cell": {"resolved": False}}, {"cell": {"resolved": False}},
     )
-    assert comparison["all_comparable_cells_agree"] is False
+    assert comparison["kernel_bias"]["all_agree"] is False
     assert comparison["num_comparable"] == 0
-    assert "UNDETERMINED" in comparison["verdict"]
+    assert "UNDETERMINED" in comparison["kernel_bias"]["verdict"]
 
 
 # --- the matrix ------------------------------------------------------------
@@ -362,3 +364,64 @@ def test_the_gate_refuses_a_baseline_whose_tokens_moved(tiny_generator):
             baseline_mod.assert_token_identical(tiny_generator, batches)
     finally:
         tiny_generator.generate_batch = real
+
+
+# --- the two questions must not be pooled ----------------------------------
+
+
+def test_a_cell_where_only_the_engine_moved_cannot_decide_kernel_bias():
+    """The finding that would have produced a confidently wrong conclusion.
+
+    On the mixed stream HF's ragged batches already pre-expand K/V, so Arm B's
+    patch is INERT on the baseline and it runs byte-identical code in both arms.
+    Only the engine moves, MATH -> EFFICIENT, worth 2.76-5.67x on the attention
+    call. That shift necessarily raises the ratio and its intervals will never
+    overlap -- so pooling it with the control cells drives the verdict to
+    "kernel choice DOES move the ratio" for a reason that is not kernel bias at
+    all, but a known handicap being lifted.
+    """
+    comparison = arms.compare_arms(
+        {"mixed": _ratio(1.9, 2.0, 2.1, baseline_expands=True)},
+        {"mixed": _ratio(5.0, 5.4, 5.8, baseline_expands=True)},
+    )
+    cell = comparison["cells"]["mixed"]
+    assert cell["kind"] == arms.ONLY_ENGINE_MOVED
+    assert cell["answers_kernel_bias"] is False
+    assert "handicap being lifted" in cell["direction"]
+
+    # It contributes nothing to the kernel-bias verdict...
+    assert comparison["num_deciding"] == 0
+    assert comparison["kernel_bias"]["from_cells"] == []
+    assert "UNDETERMINED" in comparison["kernel_bias"]["verdict"]
+    # ...but it is still reported, because it prices the asymmetry.
+    assert comparison["asymmetry_cost"]["from_cells"] == ["mixed"]
+    assert comparison["asymmetry_cost"]["median_shift_b_over_a"] == [pytest.approx(2.7)]
+
+
+def test_a_disagreeing_asymmetry_cell_cannot_overturn_agreeing_control_cells():
+    """Mixing the two must not let the wrong cells outvote the right ones."""
+    comparison = arms.compare_arms(
+        {"control": _ratio(1.9, 2.0, 2.1),
+         "mixed": _ratio(1.9, 2.0, 2.1, baseline_expands=True)},
+        {"control": _ratio(1.95, 2.05, 2.15),
+         "mixed": _ratio(5.0, 5.4, 5.8, baseline_expands=True)},
+    )
+    assert comparison["num_comparable"] == 2
+    assert comparison["num_deciding"] == 1
+    assert comparison["kernel_bias"]["from_cells"] == ["control"]
+    assert comparison["kernel_bias"]["all_agree"] is True, (
+        "the mixed cell's one-sided engine speedup overturned the kernel-bias "
+        "verdict that only the control cells are entitled to decide"
+    )
+    assert "does not bias" in comparison["kernel_bias"]["verdict"]
+
+
+def test_a_cell_with_no_recorded_baseline_path_decides_nothing():
+    """Absent evidence is not evidence of symmetry."""
+    a = _ratio(1.9, 2.0, 2.1); a.pop("baseline_expands_kv_unpatched")
+    b = _ratio(1.9, 2.0, 2.1); b.pop("baseline_expands_kv_unpatched")
+    comparison = arms.compare_arms({"cell": a}, {"cell": b})
+    assert comparison["cells"]["cell"]["kind"] == arms.UNKNOWN_MOVE
+    assert comparison["num_deciding"] == 0
+    assert comparison["cells_with_unrecorded_baseline_path"] == 1
+    assert "UNDETERMINED" in comparison["kernel_bias"]["verdict"]
