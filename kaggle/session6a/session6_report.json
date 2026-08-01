@@ -1,0 +1,127 @@
+{
+  "arms_requested": [
+    "A",
+    "B"
+  ],
+  "slice": "session6a",
+  "cells_requested": [
+    "control-rect3072-C64"
+  ],
+  "returncode": 0,
+  "elapsed_seconds": 11048.47,
+  "device": "Tesla T4",
+  "result_files": [
+    "armA-control-rect3072-C64.json",
+    "armB-control-rect3072-C64.json",
+    "arms_summary.json"
+  ],
+  "summary": {
+    "arms": {
+      "A": {
+        "baseline_expand_kv": false,
+        "gqa_path": "sdpa",
+        "intent": "engine on enable_gqa; baseline left exactly as HuggingFace ships it"
+      },
+      "B": {
+        "baseline_expand_kv": true,
+        "gqa_path": "repeat_kv",
+        "intent": "both sides forced onto pre-expanded K/V, hence the same kernel"
+      }
+    },
+    "baseline_token_identity": {
+      "armB-control-rect3072-C64": {
+        "batches_compared": 1,
+        "patch_verified_active": true,
+        "token_identical": true,
+        "tokens_compared": 2048
+      }
+    },
+    "cells": [
+      "control-rect3072-C64"
+    ],
+    "comparison": {
+      "asymmetry_cost": {
+        "from_cells": [],
+        "median_shift_b_over_a": [],
+        "note": "Arm A ran the engine on MATH against a baseline already on EFFICIENT_ATTENTION. These shifts price that handicap; they are NOT evidence about kernel bias."
+      },
+      "cells": {
+        "control-rect3072-C64": {
+          "answers_kernel_bias": true,
+          "arm_a_ratio": [
+            0.7699216591349258,
+            0.7702270031567741,
+            0.7712697977829863
+          ],
+          "arm_b_ratio": [
+            0.7862412113980498,
+            0.7879500571874836,
+            0.788608077771115
+          ],
+          "comparable": true,
+          "direction": "faster kernel RAISES the ratio (MATH was a floor)",
+          "intervals_overlap": false,
+          "kind": "both_sides_moved",
+          "median_shift_b_over_a": 1.0230101696747473
+        }
+      },
+      "cells_with_unrecorded_baseline_path": 0,
+      "kernel_bias": {
+        "all_agree": false,
+        "from_cells": [
+          "control-rect3072-C64"
+        ],
+        "verdict": "kernel choice DOES move the ratio; see per-cell direction"
+      },
+      "num_comparable": 1,
+      "num_deciding": 1
+    },
+    "ratios": {
+      "A": {
+        "control-rect3072-C64": {
+          "baseline_expands_kv_unpatched": false,
+          "baseline_tps": {
+            "high": 177.82041893479717,
+            "low": 177.7183830831364,
+            "median": 177.8081
+          },
+          "engine_peak_blocks": 3548,
+          "engine_preemptions": 32,
+          "engine_tps": {
+            "high": 137.0688213828499,
+            "low": 136.90779197434662,
+            "median": 136.9526
+          },
+          "gqa_path": "sdpa",
+          "ratio_high": 0.7712697977829863,
+          "ratio_low": 0.7699216591349258,
+          "ratio_median": 0.7702270031567741,
+          "resolved": true
+        }
+      },
+      "B": {
+        "control-rect3072-C64": {
+          "baseline_expands_kv_unpatched": false,
+          "baseline_tps": {
+            "high": 289.27540459465223,
+            "low": 288.7807627154424,
+            "median": 288.8744
+          },
+          "engine_peak_blocks": 3548,
+          "engine_preemptions": 32,
+          "engine_tps": {
+            "high": 227.7348421823015,
+            "low": 227.44024453616035,
+            "median": 227.6186
+          },
+          "gqa_path": "repeat_kv",
+          "ratio_high": 0.788608077771115,
+          "ratio_low": 0.7862412113980498,
+          "ratio_median": 0.7879500571874836,
+          "resolved": true
+        }
+      }
+    },
+    "smoke": false
+  }
+}
