@@ -60,21 +60,33 @@ kernel or the Gate 1 comparison is a kernel comparison with paging as a
 confound. `bench/run.py` records `sdpa_backends_enabled`, but *enabled* is not
 *selected* — the selection is shape-dependent.
 
-### The baseline side, measured — they MATCH on sm_75
+### The baseline side — its kernel DEPENDS ON THE STREAM
 
 `kaggle/session3` Item 1 intercepted the baseline's **real** SDPA calls during
-`model.generate`: 112 calls across 4 distinct shapes, 2 modules patched. Every
-one of them passed **unexpanded** K/V with `enable_gqa=True`
-(`baseline_expands_kv: false`) and selected `MATH`.
+`model.generate`: 112 calls, all passing **unexpanded** K/V with
+`enable_gqa=True` and selecting `MATH`. That was read as "the baseline matches
+the engine". **It does not generalise, and the reason is padding.**
 
-| baseline call | shape | backend |
-|---|---|---|
-| prefill ×28 | q `[4,12,512,128]` k `[4,2,512,128]` causal | `MATH` |
-| decode ×84 | q `[4,12,1,128]` k `[4,2,513…515,128]` | `MATH` |
+HuggingFace takes the `enable_gqa` path only when `attention_mask is None`
+(`transformers.integrations.sdpa_attention.use_gqa_in_sdpa`), and the mask is
+None only when nothing was left-padded. Session 3 happened to probe a
+prompt-uniform batch. The two sweep streams are not the same shape:
 
-So HF reaches SDPA exactly the way this engine does. `GQA_PATH="sdpa"` matches
-it; `GQA_PATH="repeat_kv"` does not. **That match, not memory, is why `sdpa` is
-the default** — see item 6, the memory rationale was wrong.
+| stream | prompts | mask | HF path | baseline backend (T4, measured) |
+|---|---|---|---|---|
+| `control` | all 256 are 512 tokens | dropped to `None` | `enable_gqa` | **`MATH`** |
+| `mixed` | 224 distinct lengths | real | pre-expands K/V | **`EFFICIENT_ATTENTION`** |
+
+Measured in `kaggle/session5` gate 2, on the T4, against the real streams, and
+reproduced on CPU in `tests/test_arms.py`.
+
+**So the shipping configuration is not symmetric.** On `control` both sides are
+`MATH`. On `mixed` the baseline gets `EFFICIENT_ATTENTION`, the fast kernel,
+while the engine's masked fused call stays on `MATH` — an asymmetry **against**
+the engine that nobody chose and that was invisible until it was measured.
+
+That is why `sdpa` is the default — it matches on the stream the headline is
+quoted from — and it is **not** a memory saving; see item 6.
 
 ### Symmetry is not neutrality — the bias is UNMEASURED AND OF UNKNOWN SIGN
 

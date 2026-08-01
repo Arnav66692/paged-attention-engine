@@ -27,9 +27,15 @@ REQUIRED_ITEMS = {
     "expandable_segments": r"expandable_segments",
     "fp16_tolerance": r"FP16_LOGIT_ATOL",
     "memory_caps": r"max_num_batched_tokens",
-    # Measured in session3/session4. Both are facts about which backend
-    # `enable_gqa` selects, so both move on Ampere.
-    "baseline_backend_matches": r"baseline_expands_kv",
+    # Measured in session3/session4/session5. All are facts about which backend
+    # `enable_gqa` selects, so all move on Ampere.
+    #
+    # The baseline's kernel depends on whether the stream's prompts are UNIFORM,
+    # because HF only takes enable_gqa when the attention mask is None and the
+    # mask is None only when nothing was padded. Session 3 probed a uniform
+    # batch and the conclusion was generalised to both streams; it does not
+    # generalise. If this item goes missing, that mistake is available again.
+    "baseline_kernel_is_stream_dependent": r"use_gqa_in_sdpa",
     "symmetry_is_not_neutrality": r"[Ss]ymmetry is not neutrality|"
                                   r"[Ss]ymmetry.{0,40}not.{0,20}neutral",
     "enable_gqa_memory_claim": r"memory saving does not exist",
@@ -67,6 +73,22 @@ def test_the_list_says_the_tolerance_is_not_to_be_tightened():
     assert re.search(r"not to be tightened|NOT to be tightened", text), (
         "the list must carry the rule that FP16_LOGIT_ATOL is not adjusted to "
         "suit a measurement, or a future run will quietly fit it"
+    )
+
+
+def test_the_list_records_that_the_two_streams_get_different_baseline_kernels():
+    """The asymmetry that was invisible until it was measured.
+
+    On `control` both sides run MATH. On `mixed` the baseline gets
+    EFFICIENT_ATTENTION and the engine stays on MATH -- an asymmetry AGAINST the
+    engine. A summary that keeps only the control row reads as "symmetric".
+    """
+    text = RECHECK.read_text()
+    for token in ("control", "mixed", "EFFICIENT_ATTENTION", "MATH"):
+        assert token in text, f"{token} missing from the backend-selection item"
+    assert re.search(r"DEPENDS ON THE STREAM|depends on the stream", text), (
+        "the list no longer says the baseline's kernel is stream-dependent, "
+        "which is the fact that invalidated the earlier 'they match' reading"
     )
 
 

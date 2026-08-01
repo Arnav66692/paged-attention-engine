@@ -86,10 +86,13 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 # this is not a free choice. The measurement that settles it is which backend the
 # HF BASELINE lands on -- engine on MATH against a baseline on EFFICIENT would be
 # a kernel comparison wearing paging as a disguise, with the handicap on our
-# side. See kaggle/session3 and docs/AMPERE_RECHECK.md.
+# side. See kaggle/session3, kaggle/session5 and docs/AMPERE_RECHECK.md.
 #
-# This switch is temporary. Once the decision is made it collapses to one value
-# and this comment goes with it.
+# This switch is NOT temporary any more. It is the knob `bench/arms.py` turns to
+# run the same sweep under both kernels, because the baseline's own kernel turns
+# out to depend on whether the stream's prompts are uniform -- so no single
+# setting is symmetric on both streams, and which way that biases the ratio is
+# a measurement rather than a choice.
 GQA_PATH = os.environ.get("PAGED_ATTENTION_GQA_PATH", "sdpa")
 if GQA_PATH not in ("sdpa", "repeat_kv"):
     raise ValueError(
@@ -175,17 +178,27 @@ def _sdpa(
     `bench/run.py` now records which backend runs. See
     `kaggle/session2` for the measurement that established this.
 
-    WHY `sdpa` IS THE DEFAULT, GIVEN THAT IT IS SLOWER AND HEAVIER. Because the
-    HF baseline lands on the same kernel. `kaggle/session3` intercepted the
-    baseline's real SDPA calls during `model.generate` -- 112 of them across 4
-    distinct shapes -- and every one passed unexpanded K/V with `enable_gqa=True`
-    and selected MATH. The engine on `enable_gqa` selects MATH too. They match.
+    WHY `sdpa` IS THE DEFAULT, GIVEN THAT IT IS SLOWER AND HEAVIER -- AND WHY
+    THAT REASON ONLY COVERS ONE OF THE TWO STREAMS. `kaggle/session3`
+    intercepted the baseline's real SDPA calls during `model.generate`: 112 of
+    them, all passing unexpanded K/V with `enable_gqa=True`, all selecting MATH.
+    Read as "the baseline matches the engine". IT DOES NOT GENERALISE.
 
-    Switching this engine to `repeat_kv` would buy 2.76-5.67x on the attention
-    call (`kaggle/session4`) and put the engine on EFFICIENT_ATTENTION while the
-    baseline stayed on MATH. That is a 4.5x kernel advantage handed to one side
-    of a comparison that is supposed to be measuring paging. The speed is real
-    and it is not takeable unilaterally.
+    HuggingFace takes the `enable_gqa` path only when the attention mask is
+    None, and the mask is None only when nothing was left-padded. Session 3
+    probed a prompt-uniform batch. Measured in `kaggle/session5` gate 2:
+
+    | stream | prompts | HF path | baseline backend |
+    |---|---|---|---|
+    | control | all 512 tokens | enable_gqa | MATH -- matches the engine |
+    | mixed | 224 lengths | pre-expands | EFFICIENT_ATTENTION -- does NOT |
+
+    So on `mixed` the baseline already holds the fast kernel while this engine
+    sits on MATH: an asymmetry AGAINST the engine that nobody chose. Switching
+    to `repeat_kv` would buy 2.76-5.67x (`kaggle/session4`) and, on `control`,
+    hand the engine the fast kernel while the baseline kept MATH -- the same
+    confound pointing the other way. Neither path is symmetric on both streams,
+    which is the whole reason `bench/arms.py` exists.
 
     WHETHER THE SHARED KERNEL BIASES THE RATIO IS UNMEASURED AND OF UNKNOWN
     SIGN. Symmetric is not the same as unbiased, but the direction cannot be
