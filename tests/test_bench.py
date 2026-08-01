@@ -626,3 +626,40 @@ def test_provenance_records_sdpa_backends_and_allocator_conf():
     assert set(provenance.allocator_conf) == {
         "PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"
     }
+
+
+def test_every_arm_cell_is_assigned_to_exactly_one_kaggle_slice():
+    """A cell with no slice never runs, and a matrix with a hole reads as full.
+
+    The four session6 kernels are identical files that pick their cell from
+    their own filename. That is only safe while the table and the matrix agree,
+    and they live in different files.
+    """
+    import ast
+
+    from bench.arms import CELLS, cell_name
+
+    repo_root = Path(__file__).resolve().parent.parent
+    slices = None
+    for candidate in sorted((repo_root / "kaggle").glob("session6?/session6?.py")):
+        for node in ast.walk(ast.parse(candidate.read_text())):
+            if (isinstance(node, ast.Assign)
+                    and getattr(node.targets[0], "id", "") == "SLICES"):
+                table = ast.literal_eval(node.value)
+                assert slices is None or table == slices, (
+                    f"{candidate.name} carries a different slice table; the "
+                    "four kernels must be identical copies"
+                )
+                slices = table
+    if slices is None:
+        pytest.skip("session6 slices not present")
+
+    assigned = list(slices.values())
+    known = {cell_name(cell) for cell in CELLS}
+    assert set(assigned) == known, (
+        f"slice table and arm matrix disagree: only-in-table={set(assigned) - known}, "
+        f"only-in-matrix={known - set(assigned)}"
+    )
+    assert len(assigned) == len(set(assigned)), (
+        f"a cell is assigned to two slices and would be measured twice: {assigned}"
+    )

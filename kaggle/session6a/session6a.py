@@ -14,10 +14,19 @@ the two mechanisms known to be in play have opposite signs. Running both
 configurations is the only way to find out, so the answer is a measurement
 rather than a hedge in a docstring.
 
-SPLIT ACROSS KERNELS. Kaggle caps a session well below the full matrix, so
-SESSION6_ARMS and SESSION6_CELLS select a slice. Each cell writes its own result
-file; `bench/arms.py --compare-only` joins them afterwards. A slice that dies
-loses its own cell and nothing else.
+SPLIT ACROSS KERNELS, ONE CELL PER KERNEL, BOTH ARMS INSIDE IT. Kaggle caps a
+session below the full matrix, so the matrix is sliced -- but the slice boundary
+is chosen to protect the comparison. Arm A and Arm B for a given cell run
+back to back in the SAME session on the SAME physical T4, because the question
+is whether A and B differ, and splitting them across two Kaggle hosts would fold
+host-to-host variance into exactly the difference being measured. Different
+CELLS may land on different hosts; that is fine, since cells are never compared
+to each other.
+
+The slice is taken from this file's own name, so the four kernels are identical
+copies and there is no environment to get wrong. Each cell writes its own result
+file as it finishes, so a session that dies after Arm A still leaves Arm A's
+data, and `bench/arms.py --compare-only` joins whatever exists.
 """
 
 import json
@@ -36,8 +45,21 @@ WORKING = Path(os.environ.get("SESSION6_WORKING", "/kaggle/working"))
 INPUT_ROOT = Path(os.environ.get("SESSION6_INPUT", "/kaggle/input"))
 RESULTS = WORKING / "arms"
 REPORT = WORKING / "session6_report.json"
-ARMS = [a for a in os.environ.get("SESSION6_ARMS", "A,B").split(",") if a]
-CELLS = [c for c in os.environ.get("SESSION6_CELLS", "").split(",") if c]
+# Which cell this kernel owns, keyed by its own filename. Both arms, always.
+SLICES = {
+    "session6a": "control-rect3072-C64",
+    "session6b": "control-rect1757-C64",
+    "session6c": "mixed-rect3072-C64",
+    "session6d": "mixed-rect1757-C64",
+}
+SLICE = Path(__file__).stem
+if SLICE not in SLICES:
+    raise SystemExit(
+        f"{SLICE} is not a known slice. Known: {sorted(SLICES)}. The cell is "
+        "taken from the filename so the four kernels can be identical copies."
+    )
+ARMS = ["A", "B"]
+CELLS = [SLICES[SLICE]]
 
 WORKING.mkdir(parents=True, exist_ok=True)
 import torch  # noqa: E402
@@ -61,7 +83,7 @@ RESULTS.mkdir(parents=True, exist_ok=True)
 
 print(f"device: {torch.cuda.get_device_name(0)} "
       f"sm_{''.join(map(str, torch.cuda.get_device_capability(0)))}", flush=True)
-print(f"arms={ARMS} cells={CELLS or 'ALL'}", flush=True)
+print(f"slice={SLICE}: arms={ARMS} cell={CELLS[0]}", flush=True)
 
 argv = [sys.executable, "-m", "bench.arms", "--out-dir", str(RESULTS)]
 for arm in ARMS:
@@ -75,7 +97,8 @@ elapsed = time.perf_counter() - started
 
 payload = {
     "arms_requested": ARMS,
-    "cells_requested": CELLS or "ALL",
+    "slice": SLICE,
+    "cells_requested": CELLS,
     "returncode": done.returncode,
     "elapsed_seconds": round(elapsed, 2),
     "device": torch.cuda.get_device_name(0),
