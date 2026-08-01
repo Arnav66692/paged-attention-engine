@@ -551,3 +551,46 @@ def test_passes_that_do_different_amounts_of_work_are_refused():
 # --- F2: the MEASURED fragmentation plot -----------------------------------
 
 
+
+
+def test_baseline_takes_the_same_concurrency_cap_as_the_engine():
+    """Residency becomes min(rectangle limit, C), so a sweep compares like with like.
+
+    Without this the baseline was hard-capped at 18 or 32 by its rectangle while
+    the engine admitted whatever fit the pool -- at C=8 that was engine-at-64
+    against baseline-at-18, and no ratio out of that means anything.
+    """
+    stream = workload.build_stream("control", seed=0, c=4)
+    rectangle = baseline_mod.RECTANGLE_P95
+    structural = baseline_mod.max_resident(rectangle)
+    assert structural == 32
+
+    observed = {}
+    for cap in (None, 4, 8, 64):
+        ticks = iter([0.0, 1.0])
+        generator = _FakeGenerator()
+        result = baseline_mod.run_baseline(
+            stream, generator, rectangle, max_num_seqs=cap,
+            clock=lambda: next(ticks),
+        )
+        observed[cap] = {
+            "effective_resident": result.max_resident,
+            "widest_batch": max(generator.batch_sizes),
+            "num_batches": result.num_batches,
+        }
+        print(f"\ncap={cap}: {observed[cap]}")
+        assert result.max_num_seqs == cap
+
+    # Uncapped, the rectangle's own limit binds.
+    assert observed[None]["effective_resident"] == structural
+    # A cap below it binds instead, and the batches actually shrink.
+    assert observed[4]["effective_resident"] == 4
+    assert observed[4]["widest_batch"] == 4
+    assert observed[8]["effective_resident"] == 8
+    assert observed[8]["widest_batch"] == 8
+    # A cap above it does NOT raise residency past what the bytes allow.
+    assert observed[64]["effective_resident"] == structural, (
+        "max_num_seqs must not let the baseline exceed its own KV byte ceiling"
+    )
+    # More batches at a tighter cap, same work.
+    assert observed[4]["num_batches"] > observed[None]["num_batches"]

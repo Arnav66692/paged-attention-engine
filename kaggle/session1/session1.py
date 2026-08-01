@@ -563,6 +563,8 @@ for rectangle in baseline_mod.RECTANGLE_SIZINGS:
             "rejection_rate": observed.rejection_rate,
             "generated_tokens": observed.generated_tokens,
             "num_batches": observed.num_batches,
+            "max_num_seqs": observed.max_num_seqs,
+            "effective_resident": observed.max_resident,
             "slot_waste": observed.slot_waste,
         })
     except Exception as error:  # noqa: BLE001
