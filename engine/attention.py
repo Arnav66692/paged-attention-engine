@@ -43,7 +43,23 @@ from engine.cache import (
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """Expand KV heads to query heads for GQA. Equivalent to repeat_interleave on dim 1."""
+    """Expand KV heads to query heads for GQA, MATERIALISING the copy.
+
+    NO LONGER ON THE ATTENTION PATH. `_sdpa` hands unexpanded K/V to SDPA with
+    `enable_gqa=True`, which broadcasts internally and allocates nothing. This is
+    kept as the reference the switch was checked against, and because
+    `kaggle/session1` uses it to measure what the expansion costs.
+
+    Why it had to go: `expand` is a view, but `reshape` on an expanded tensor
+    cannot be, so it copies. Measured on a T4 at the headline model's 6x GQA
+    ratio (12 query heads, 2 KV heads):
+
+        batch 8,  kv_len 3072:  12 MiB source -> +72 MiB copy
+        batch 64, kv_len 3072:  96 MiB source -> +576 MiB copy
+
+    K and V both, every layer -- 1.125 GiB of transient allocation per layer at
+    batch 64, on a card with 14.56 GiB total and 4.4 GiB already static.
+    """
     if n_rep == 1:
         return x
     batch, num_kv_heads, seq_len, head_dim = x.shape
@@ -85,20 +101,29 @@ def _sdpa(
     """The one attention call every path in this file shares.
 
     Contiguous, paged and fused all arrive here with the same scale and the same
-    GQA expansion, so a disagreement between them is masking or addressing and
+    GQA handling, so a disagreement between them is masking or addressing and
     never the attention itself. Exactly one of `is_causal` and `attn_mask` is
     ever set: the single-sequence backends take the causal shortcut, and the
     fused batch supplies an explicit mask because padding makes the shortcut
     wrong.
+
+    GQA IS SDPA'S JOB, NOT OURS. K and V go in with their own head count and
+    `enable_gqa=True` broadcasts them across the query heads inside the kernel.
+    The alternative -- `repeat_kv` above -- materialises the expansion, which at
+    the headline model's 6x ratio is 1.125 GiB of transient allocation per layer
+    at batch 64 on a 14.56 GiB card. The two are BIT-EXACT: verified equal, not
+    merely close, masked and causal, on cpu and mps, before the switch was made.
+    `tests/test_attention_gqa.py` keeps checking that.
     """
     return F.scaled_dot_product_attention(
         query,
-        repeat_kv(keys, num_kv_groups),
-        repeat_kv(values, num_kv_groups),
+        keys,
+        values,
         attn_mask=attn_mask,
         dropout_p=0.0,
         scale=scale,
         is_causal=is_causal,
+        enable_gqa=num_kv_groups > 1,
     )
 
 
