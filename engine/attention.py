@@ -187,12 +187,16 @@ def _sdpa(
     of a comparison that is supposed to be measuring paging. The speed is real
     and it is not takeable unilaterally.
 
-    Symmetry is not the same as neutrality, and this is the one place to say so:
-    MATH is expensive per unit of attention work, the baseline does more
-    attention work per useful token because it pads, so a uniformly expensive
-    kernel AMPLIFIES the baseline's padding waste. A Gate 1 ratio measured with
-    both sides on MATH is expected to be an UPPER bound on the paging advantage,
-    not an unbiased estimate of it. `docs/AMPERE_RECHECK.md` item 2 carries this.
+    WHETHER THE SHARED KERNEL BIASES THE RATIO IS UNMEASURED AND OF UNKNOWN
+    SIGN. Symmetric is not the same as unbiased, but the direction cannot be
+    reasoned out. Raising the per-token cost `k` for both sides drives
+    `(B_e/B_b)(W + B_b·k)/(W + B_e·k)` toward 1, which makes MATH a FLOOR; while
+    static-batch stragglers make the baseline recompute finished sequences until
+    its batch drains, which is real wasted per-token work and makes MATH a
+    CEILING. The rectangle sizing does not decide it -- that is a cache
+    allocation, and HF masks over the true kv_len. Two effects, opposite signs.
+    `bench/arms.py` runs both configurations to settle it by measurement;
+    `docs/AMPERE_RECHECK.md` item 2 carries the open question until it does.
     """
     if GQA_PATH == "repeat_kv" and num_kv_groups > 1:
         return F.scaled_dot_product_attention(

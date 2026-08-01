@@ -351,3 +351,149 @@ def load_baseline(model_id: str = BENCH_MODEL, device: str = "cuda", dtype=torch
     model.eval()
     model.to(device)
     return HuggingFaceGenerator(model, tokenizer, device)
+
+
+# --- Arm B: forcing the baseline onto the same kernel as the engine ---------
+#
+# The engine and the baseline must run the SAME SDPA kernel or the Gate 1 ratio
+# is partly a kernel comparison. Which kernel each side gets is decided by input
+# SHAPE, and for the baseline that shape is decided by one HuggingFace helper:
+#
+#     transformers.integrations.sdpa_attention.use_gqa_in_sdpa(mask, key) -> bool
+#
+#     True  -> HF passes unexpanded K/V with enable_gqa=True
+#     False -> HF calls repeat_kv first and passes expanded K/V
+#
+# and HF returns True only when `attention_mask is None`. That makes the
+# baseline's kernel DEPEND ON THE STREAM, which is not obvious and was missed
+# once already:
+#
+#   control stream -- every prompt is 512 tokens, so left padding adds nothing,
+#     transformers drops the all-ones mask to None, and HF takes enable_gqa.
+#   mixed stream -- 224 distinct prompt lengths, so the mask is real, and HF
+#     pre-expands. On a T4 that is EFFICIENT_ATTENTION, the fast kernel, while
+#     the engine's masked fused call sits on MATH.
+#
+# Forcing this helper to False makes the baseline pre-expand unconditionally,
+# which is what `GQA_PATH=repeat_kv` does on the engine side. It changes the
+# input SHAPE and nothing else -- not the arithmetic HF intends, not the mask,
+# not `is_causal`, whose expression does not reference this at all.
+#
+# This is a patch applied to the baseline and it must therefore clear a bar:
+# `assert_token_identical` below. A baseline whose answers moved is a different
+# baseline and may not be timed.
+
+
+class BaselineNotIdentical(RuntimeError):
+    """The patched baseline answers differently. Arm B may not be timed."""
+
+
+def force_baseline_kv_expansion():
+    """Make HF pre-expand K/V on every call. Returns an undo callable.
+
+    Raises rather than degrading if the helper is not where it is expected --
+    a silently unapplied patch would leave Arm B measuring Arm A twice, which
+    is the one failure mode that looks like a clean result.
+    """
+    from transformers.integrations import sdpa_attention
+
+    original = getattr(sdpa_attention, "use_gqa_in_sdpa", None)
+    if not callable(original):
+        raise RuntimeError(
+            "transformers.integrations.sdpa_attention.use_gqa_in_sdpa is missing "
+            f"(transformers has {sorted(n for n in dir(sdpa_attention) if 'gqa' in n.lower())}). "
+            "Arm B cannot force the baseline onto the expanded-K/V path without "
+            "it, and guessing another patch point would be measuring something "
+            "unknown. Re-derive the patch for this transformers version."
+        )
+
+    def never_use_gqa(attention_mask, key):
+        return False
+
+    sdpa_attention.use_gqa_in_sdpa = never_use_gqa
+
+    def undo():
+        sdpa_attention.use_gqa_in_sdpa = original
+
+    return undo
+
+
+def baseline_expands_kv_for(generator: "HuggingFaceGenerator", batch) -> bool:
+    """Does the baseline pre-expand K/V for THIS batch? Observed, not assumed."""
+    from transformers.integrations import sdpa_attention
+
+    observed: list[bool] = []
+    current = sdpa_attention.use_gqa_in_sdpa
+
+    def spy(attention_mask, key):
+        result = current(attention_mask, key)
+        observed.append(not result)
+        return result
+
+    sdpa_attention.use_gqa_in_sdpa = spy
+    try:
+        generator.generate_batch(batch)
+    finally:
+        sdpa_attention.use_gqa_in_sdpa = current
+    if not observed:
+        raise RuntimeError(
+            "no SDPA GQA decision was observed during a baseline batch; the "
+            "attention implementation is not the sdpa one this probe assumes"
+        )
+    return all(observed)
+
+
+def assert_token_identical(generator: "HuggingFaceGenerator", batches) -> dict:
+    """Arm B's prerequisite: the patched baseline must answer identically.
+
+    Pre-expanding K/V is mathematically a no-op -- `tests/test_attention_gqa.py`
+    holds the two expansions to `torch.equal` -- but it changes which kernel
+    torch selects, and kernels differ in accumulation order. In fp16 that can
+    move a token. If it does, Arm B is timing a baseline that gives different
+    answers, which is not the baseline, and the arm is void.
+
+    Returns the evidence. Raises `BaselineNotIdentical` on any mismatch.
+    """
+    unpatched = [generator.generate_batch(batch) for batch in batches]
+
+    undo = force_baseline_kv_expansion()
+    try:
+        patched = [generator.generate_batch(batch) for batch in batches]
+        expanded = [baseline_expands_kv_for(generator, batch) for batch in batches]
+    finally:
+        undo()
+
+    compared = 0
+    for index, (before, after) in enumerate(zip(unpatched, patched)):
+        if before.keys() != after.keys():
+            raise BaselineNotIdentical(
+                f"batch {index}: patched baseline returned a different request set"
+            )
+        for request_id, tokens in before.items():
+            compared += len(tokens)
+            if tokens != after[request_id]:
+                first = next(
+                    (position for position, (a, b) in enumerate(zip(tokens, after[request_id])) if a != b),
+                    min(len(tokens), len(after[request_id])),
+                )
+                raise BaselineNotIdentical(
+                    f"batch {index}, request {request_id}: patched baseline "
+                    f"diverged at token {first} of {len(tokens)} "
+                    f"({tokens[max(0, first - 2):first + 2]} vs "
+                    f"{after[request_id][max(0, first - 2):first + 2]}). "
+                    "Pre-expanding K/V changed the baseline's answers, so Arm B "
+                    "would be timing a different baseline. Arm B is VOID."
+                )
+
+    if not all(expanded):
+        raise BaselineNotIdentical(
+            "the patch did not take: the baseline still chose enable_gqa on at "
+            "least one probed batch. Arm B would silently repeat Arm A."
+        )
+
+    return {
+        "batches_compared": len(batches),
+        "tokens_compared": compared,
+        "token_identical": True,
+        "patch_verified_active": True,
+    }

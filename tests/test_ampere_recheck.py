@@ -70,25 +70,41 @@ def test_the_list_says_the_tolerance_is_not_to_be_tightened():
     )
 
 
-def test_the_list_states_which_way_the_sm75_kernel_biases_the_headline():
-    """The direction of a known bias is the part that must not go missing.
+def test_the_kernel_bias_is_recorded_as_unmeasured_and_unsigned():
+    """An asserted direction is worse than an admitted gap.
 
-    Both sides run MATH, so the comparison is symmetric. Symmetric is not
-    unbiased: MATH is expensive per unit of attention work and the baseline does
-    more attention work per useful token because it pads, so the slow kernel
-    amplifies the baseline's waste. The Gate 1 ratio on sm_75 is an UPPER bound.
+    A previous revision of the list claimed the sm_75 headline was an UPPER
+    bound, on the theory that a slow kernel amplifies the baseline's padding
+    waste. That was asserted, not measured, and it ignored the opposing
+    mechanism: in `ratio = (B_e/B_b)(W + B_b·k)/(W + B_e·k)`, raising the
+    per-token cost `k` for both sides drives the ratio toward 1, which would
+    make the same number a FLOOR.
 
-    A reader who takes the number without this reads a ceiling as an estimate.
+    Both mechanisms are real. The rectangle sizing does not settle it -- that is
+    a cache allocation and HF masks over the true kv_len -- but static-batch
+    stragglers are genuine wasted per-token work. Sign unknown until the two
+    arms are run.
+
+    This test fails if anyone reintroduces a direction without a measurement.
     """
     text = RECHECK.read_text()
-    assert re.search(r"upper bound|UPPER bound", text), (
-        "the list no longer says the sm_75 headline is an upper bound on the "
-        "paging advantage. That is the direction of a known, unquantified bias; "
-        "without it the number reads as unbiased."
+    assert re.search(r"UNKNOWN SIGN|unknown sign", text), (
+        "the list must state that the kernel's effect on the ratio is of "
+        "unknown sign until both arms are measured"
     )
-    assert re.search(r"unmeasured|not.{0,30}quantif", text), (
-        "the size of the amplification is unmeasured and the list must say so "
-        "rather than implying it is small"
+    assert re.search(r"UNMEASURED|unmeasured", text), (
+        "the list must state the bias is unmeasured rather than implying a size"
+    )
+    for mechanism in (r"FLOOR|floor", r"CEILING|ceiling"):
+        assert re.search(mechanism, text), (
+            f"the list dropped one of the two opposing mechanisms ({mechanism}); "
+            "keeping only one is how an asserted direction gets back in"
+        )
+    unhedged = re.search(r"is (?:therefore )?an upper bound", text)
+    assert unhedged is None, (
+        "the list asserts an upper bound again. That direction is exactly what "
+        "arms A and B exist to measure; it may be written down only with the "
+        "measurement that establishes it."
     )
 
 

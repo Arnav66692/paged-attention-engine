@@ -53,6 +53,7 @@ from typing import Callable, Sequence
 import torch
 
 from bench import baseline as baseline_mod
+from engine import attention as attention_mod
 from bench import workload
 from bench.workload import BLOCK_SIZE, NUM_GPU_BLOCKS, PRESSURE_C
 from engine.cache import ADMISSION_MARGIN_BLOCKS, BlockAllocator
@@ -230,9 +231,17 @@ class Provenance:
     fp32_precision: dict
     sdpa_backends_enabled: dict
     allocator_conf: dict
+    # WHICH ARM. The engine's GQA path and whether the baseline was forced onto
+    # the expanded-K/V path. These decide which SDPA kernel each side runs, and
+    # a ratio is only interpretable next to them.
+    gqa_path: str
+    baseline_kv_expansion_forced: bool
 
     @classmethod
-    def collect(cls, model_id: str, dtype: str, stream_digest: str) -> "Provenance":
+    def collect(
+        cls, model_id: str, dtype: str, stream_digest: str,
+        *, baseline_kv_expansion_forced: bool = False,
+    ) -> "Provenance":
         return cls(
             num_gpu_blocks=NUM_GPU_BLOCKS,
             block_size=BLOCK_SIZE,
@@ -265,6 +274,10 @@ class Provenance:
                 name: os.environ.get(name)
                 for name in ('PYTORCH_ALLOC_CONF', 'PYTORCH_CUDA_ALLOC_CONF')
             },
+            # Read from the module rather than the environment: the module is
+            # what the kernel calls actually obeyed.
+            gqa_path=attention_mod.GQA_PATH,
+            baseline_kv_expansion_forced=baseline_kv_expansion_forced,
         )
 
 
@@ -309,8 +322,15 @@ class LevelResult:
 
     @property
     def median_tokens_per_second(self) -> float | None:
-        """None when the level is UNRESOLVED. There is no number to report."""
-        if self.unresolved or not self.throughput_valid:
+        """None when the level is UNRESOLVED. There is no number to report.
+
+        A level with no passes has no throughput either. `collect()` always
+        records at least one, so this is unreachable through the sweep -- but
+        `describe()` must be total, because the one caller that hits an
+        un-passed level is a harness reading a partial run, and raising
+        `StatisticsError` out of a serialiser hides which level was empty.
+        """
+        if self.unresolved or not self.throughput_valid or not self.passes:
             return None
         median = self.median_seconds
         return self.generated_tokens / median if median > 0 else None
@@ -636,6 +656,7 @@ def write_results(
     results: Sequence[LevelResult],
     *,
     smoke: bool,
+    baseline_identity: dict | None = None,
 ) -> Path:
     """Persist a run. Refuses to write a real result off a CUDA host."""
     if not smoke and not torch.cuda.is_available():
@@ -654,6 +675,9 @@ def write_results(
         "spread_limit": SPREAD_LIMIT,
         "pressure_c": PRESSURE_C,
         "provenance": asdict(provenance),
+        # Arm B's gate. None on Arm A, where nothing was patched and there is
+        # nothing to attest.
+        "baseline_token_identity": baseline_identity,
         "levels": [result.describe() for result in results],
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -726,6 +750,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--smoke", action="store_true",
         help="structural run: no timing claim. Required off a CUDA host.",
     )
+    parser.add_argument(
+        "--baseline-expand-kv", action="store_true",
+        help=(
+            "Arm B: force the baseline to pre-expand K/V so it lands on the "
+            "same kernel as GQA_PATH=repeat_kv. Gated on token identity."
+        ),
+    )
     args = parser.parse_args(argv)
 
     concurrencies = args.concurrency or [PRESSURE_C]
@@ -759,8 +790,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         return engine.new_paged_cache(allocator.num_blocks, allocator.block_size)
 
     reference = workload.build_stream(args.stream, args.seed, concurrencies[0])
+
+    # ARM B'S PREREQUISITE, BEFORE ANY TIMING. Pre-expanding K/V is a no-op
+    # mathematically and a kernel change in practice; if the kernel change moved
+    # a token then the thing about to be timed is not this baseline. Checked on
+    # the real stream's own batches, and on a prompt-uniform batch specifically,
+    # because that is the case where the patch actually changes HF's behaviour
+    # (ragged batches already pre-expand, so the patch is inert there).
+    baseline_identity = None
+    if args.baseline_expand_kv:
+        probe_batch = list(reference[: baseline_mod.max_resident(args.rectangle)])
+        control_batch = list(
+            workload.build_stream("control", args.seed, concurrencies[0])[:4]
+        )
+        print("Arm B prerequisite: patched baseline vs unpatched, token identity")
+        baseline_identity = baseline_mod.assert_token_identical(
+            generator, [probe_batch[:4], control_batch]
+        )
+        print(f"  {baseline_identity}")
+        baseline_mod.force_baseline_kv_expansion()
+        print("  patch applied for the timed passes")
+
     provenance = Provenance.collect(
-        args.model, str(dtype), workload.stream_digest(reference)
+        args.model, str(dtype), workload.stream_digest(reference),
+        baseline_kv_expansion_forced=args.baseline_expand_kv,
     )
 
     results = sweep(
@@ -772,7 +825,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         throughput_valid=not args.smoke and torch.cuda.is_available(),
     )
 
-    written = write_results(args.out, provenance, results, smoke=args.smoke)
+    written = write_results(
+        args.out, provenance, results, smoke=args.smoke,
+        baseline_identity=baseline_identity,
+    )
     print(f"wrote {written}")
     return 0
 

@@ -76,7 +76,7 @@ So HF reaches SDPA exactly the way this engine does. `GQA_PATH="sdpa"` matches
 it; `GQA_PATH="repeat_kv"` does not. **That match, not memory, is why `sdpa` is
 the default** — see item 6, the memory rationale was wrong.
 
-### Symmetry is not neutrality — the bias direction is known and unquantified
+### Symmetry is not neutrality — the bias is UNMEASURED AND OF UNKNOWN SIGN
 
 `kaggle/session4` timed the two paths on the shapes the engine actually issues:
 
@@ -87,13 +87,45 @@ the default** — see item 6, the memory rationale was wrong.
 | decode 64×2048 | 24.47 ms | 8.78 ms | 2.79× |
 | prefill 16×512 | 14.93 ms | 2.63 ms | 5.67× |
 
-Both sides being on MATH makes the comparison **symmetric**. It does not make it
-**neutral**. MATH is expensive per unit of attention work; the baseline does more
-attention work per useful token because it pads to a rectangle; so a uniformly
-expensive kernel amplifies the baseline's padding waste. **A Gate 1 ratio taken
-on sm_75 is therefore expected to be an upper bound on the paging advantage, not
-an unbiased estimate.** The size of that inflation is **unmeasured** and cannot
-be measured without moving both sides to the same faster kernel.
+Both sides being on MATH makes the comparison **symmetric**. It does not
+establish that the kernel is neutral. **Which way it biases the ratio — if at
+all — is UNMEASURED AND OF UNKNOWN SIGN.** Two mechanisms are known, they pull
+in opposite directions, and neither can be called from theory.
+
+**Mechanism 1 — a slow kernel shrinks the ratio (T4 number would be a FLOOR).**
+Model the throughput ratio as
+
+```
+ratio = (B_e / B_b) · (W + B_b·k) / (W + B_e·k)
+```
+
+with `W` the batch-independent per-step weight loading, `k` the per-token cost,
+`B_e` and `B_b` the engine's and baseline's batch sizes. As `k` rises the ratio
+falls toward 1. A slower attention kernel raises `k` for **both** sides, so MATH
+would *compress* the advantage and the sm_75 number would understate it.
+
+**Mechanism 2 — a slow kernel inflates the ratio (T4 number would be a CEILING).**
+This needs the baseline to do more attention work *per useful token*. The
+rectangle sizing alone does **not** do that — it is a KV cache **allocation**,
+and HF masks over the actual `kv_len`. **Static-batch stragglers do**: a finished
+sequence keeps being computed until the whole batch drains, and that is real
+wasted per-token work that a more expensive kernel makes more expensive.
+
+An earlier revision of this file asserted mechanism 2 and labelled the headline
+an upper bound. That was a direction claimed without measurement, and it ignored
+mechanism 1 entirely. **An asserted direction is worse than an admitted gap.**
+
+**To resolve.** Run the sweep twice, same host, same session:
+
+- **Arm A** — both sides on `MATH`: `GQA_PATH=sdpa`, baseline unpatched.
+- **Arm B** — both sides on `EFFICIENT_ATTENTION`: `GQA_PATH=repeat_kv`, baseline
+  patched to pre-expand K/V. Arm B is **void unless** the patched baseline is
+  token-identical to the unpatched one.
+
+If the two ratios agree within measurement spread, kernel choice does not bias
+the result and the headline ships with no hedge at all. If they differ, the
+direction and magnitude *is* the finding. Until then this entry says only that
+the question is open.
 
 **To re-measure.** Re-run `kaggle/session3` Item 1 and `kaggle/session4`.
 On Ampere, confirm:
