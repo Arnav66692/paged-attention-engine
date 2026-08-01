@@ -154,7 +154,28 @@ def _tps_bounds(level: dict) -> tuple[float, float, float] | None:
 
 
 def ratio_for(payload: dict) -> dict | None:
-    """Engine-over-baseline throughput, as an interval, for one result file."""
+    """Engine-over-baseline throughput, as an interval, for one result file.
+
+    A result whose baseline was patched must carry the token-identity attestation
+    that licensed the patch. `bench.run` cannot produce one without it -- the
+    gate raises -- but `--compare-only` reads whatever files are in a directory,
+    and a timing from a patched-but-unverified baseline is exactly the number
+    this experiment must not report.
+    """
+    provenance = payload.get("provenance") or {}
+    if provenance.get("baseline_kv_expansion_forced"):
+        identity = payload.get("baseline_token_identity") or {}
+        if not identity.get("token_identical"):
+            return {
+                "resolved": False,
+                "why": (
+                    "baseline was patched to pre-expand K/V but the result "
+                    "carries no token-identity attestation. Arm B is void for "
+                    "this cell; a patched baseline that was never verified is "
+                    "not this baseline."
+                ),
+            }
+
     levels = payload.get("levels", [])
     engine = next((lv for lv in levels if lv["engine"] == ENGINE), None)
     baseline = next((lv for lv in levels if lv["engine"] == BASELINE), None)
@@ -228,6 +249,54 @@ def compare_arms(arm_a: dict, arm_b: dict) -> dict:
     }
 
 
+def _compare_only(out_dir: Path) -> int:
+    """Join result files written by separate sessions.
+
+    Result filenames carry the arm and the cell -- `armA-control-rect3072-C64`
+    -- so the join needs no external index. A cell present in only one arm is
+    reported as such rather than dropped, because a silently missing cell is how
+    a partial matrix reads as a complete one.
+    """
+    ratios: dict[str, dict] = {}
+    identity: dict[str, dict] = {}
+    found = sorted(out_dir.glob("arm*-*.json"))
+    if not found:
+        print(f"no arm result files in {out_dir}", file=sys.stderr)
+        return 2
+
+    for path in found:
+        stem = path.stem
+        arm, _, cell = stem[3:].partition("-")
+        if not arm or not cell:
+            continue
+        payload = json.loads(path.read_text())
+        ratios.setdefault(arm, {})[cell] = ratio_for(payload)
+        if payload.get("baseline_token_identity"):
+            identity[stem] = payload["baseline_token_identity"]
+
+    everywhere = set.intersection(*(set(v) for v in ratios.values())) if ratios else set()
+    partial = sorted({c for v in ratios.values() for c in v} - everywhere)
+
+    summary = {
+        "joined_from": [p.name for p in found],
+        "ratios": ratios,
+        "baseline_token_identity": identity,
+        "cells_missing_from_an_arm": partial,
+        "comparison": (
+            compare_arms(ratios["A"], ratios["B"])
+            if "A" in ratios and "B" in ratios
+            else {"verdict": f"only arms {sorted(ratios)} present; no comparison"}
+        ),
+    }
+    out = out_dir / "arms_summary.json"
+    out.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    print(f"joined {len(found)} result files -> {out}")
+    if partial:
+        print(f"INCOMPLETE: cells present in only one arm: {partial}")
+    print(json.dumps(summary["comparison"], indent=2, sort_keys=True))
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out-dir", type=Path, default=Path("bench/results/arms"))
@@ -237,7 +306,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="restrict to named cells, e.g. control-rect3072-C64",
     )
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument(
+        "--compare-only", action="store_true",
+        help=(
+            "run nothing; join the result files already in --out-dir. The "
+            "matrix is split across Kaggle sessions, so the comparison has to "
+            "be able to happen after the fact."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.compare_only:
+        return _compare_only(args.out_dir)
 
     arms = args.arm or sorted(ARMS)
     cells = [c for c in CELLS if not args.cell or cell_name(c) in args.cell]

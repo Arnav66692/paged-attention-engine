@@ -193,3 +193,172 @@ def test_spread_limit_is_shared_with_the_harness_not_redeclared():
         "the harness's decision and arms.py must inherit it, not restate it."
     )
     assert SPREAD_LIMIT == 0.20
+
+
+# --- the Arm B attestation -------------------------------------------------
+
+
+def _patched_payload(identity):
+    payload = _payload([2.0] * 3, [4.0] * 3)
+    payload["provenance"] = {"baseline_kv_expansion_forced": True}
+    payload["baseline_token_identity"] = identity
+    return payload
+
+
+def test_a_patched_baseline_without_its_attestation_is_not_comparable():
+    """--compare-only reads whatever files exist. This is the one that matters.
+
+    bench.run cannot write a patched result without the gate -- the gate raises
+    -- but the join step reads a directory, and a timing from a patched
+    baseline nobody verified is precisely the number Arm B must not report.
+    """
+    for missing in (None, {}, {"token_identical": False}):
+        ratio = arms.ratio_for(_patched_payload(missing))
+        assert ratio["resolved"] is False, f"accepted attestation {missing!r}"
+        assert "token-identity" in ratio["why"]
+
+
+def test_a_patched_baseline_with_its_attestation_is_comparable():
+    ratio = arms.ratio_for(_patched_payload({"token_identical": True}))
+    assert ratio["resolved"] is True
+    assert ratio["ratio_median"] == pytest.approx(2.0)
+
+
+def test_an_unpatched_baseline_needs_no_attestation():
+    """Arm A patches nothing, so demanding an attestation would void it."""
+    payload = _payload([2.0] * 3, [4.0] * 3)
+    payload["provenance"] = {"baseline_kv_expansion_forced": False}
+    assert arms.ratio_for(payload)["resolved"] is True
+
+
+# --- the Arm B patch, against the real HuggingFace code path ---------------
+#
+# Everything above is arithmetic on dictionaries. This section drives the actual
+# `use_gqa_in_sdpa` that transformers ships, because the patch is a monkeypatch
+# on a third-party module and the thing most likely to break it is an upstream
+# rename, which no amount of dictionary arithmetic would notice.
+
+
+@pytest.fixture(scope="module")
+def tiny_generator():
+    """Headline geometry, two layers. Skips if the config cannot be fetched."""
+    torch = pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    from bench import baseline as baseline_mod
+
+    try:
+        config = transformers.AutoConfig.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
+    except Exception as error:  # noqa: BLE001
+        pytest.skip(f"model config unavailable offline: {type(error).__name__}")
+    config.num_hidden_layers = 2
+    torch.manual_seed(0)
+    model = transformers.AutoModelForCausalLM.from_config(config, dtype=torch.float32)
+    model.eval()
+    model.set_attn_implementation("sdpa")
+    return baseline_mod.HuggingFaceGenerator(model, None, "cpu")
+
+
+def _requests(lengths, new_tokens=4):
+    import torch
+
+    from bench.workload import Request
+
+    torch.manual_seed(1)
+    return [
+        Request(
+            request_id=f"r{index}",
+            prompt_token_ids=tuple(int(v) for v in torch.randint(1, 1000, (length,))),
+            max_new_tokens=new_tokens,
+        )
+        for index, length in enumerate(lengths)
+    ]
+
+
+def test_hf_picks_its_gqa_path_from_padding_which_is_why_the_arm_exists(tiny_generator):
+    """The finding that reframed this whole experiment, pinned.
+
+    HF takes `enable_gqa` only when the attention mask is None, and the mask is
+    None only when nothing was padded. So the BASELINE'S KERNEL DEPENDS ON THE
+    STREAM: the control stream's prompts are all 512 tokens and take one path,
+    the mixed stream's 224 distinct lengths take the other. An earlier session
+    probed a uniform batch, concluded 'the baseline uses enable_gqa', and
+    generalised it to both streams. It does not generalise.
+    """
+    from bench import baseline as baseline_mod
+
+    uniform = baseline_mod.baseline_expands_kv_for(tiny_generator, _requests([24, 24, 24]))
+    ragged = baseline_mod.baseline_expands_kv_for(tiny_generator, _requests([8, 15, 22]))
+
+    assert uniform is False, (
+        "a prompt-uniform batch no longer takes HF's enable_gqa path. The "
+        "control stream's kernel has changed and the arm symmetry analysis in "
+        "docs/AMPERE_RECHECK.md item 2 needs re-measuring."
+    )
+    assert ragged is True, (
+        "a ragged batch no longer pre-expands. The mixed stream's kernel has "
+        "changed; same re-measurement applies."
+    )
+
+
+def test_the_patch_takes_on_both_stream_shapes_and_undoes_itself(tiny_generator):
+    from transformers.integrations import sdpa_attention
+
+    from bench import baseline as baseline_mod
+
+    original = sdpa_attention.use_gqa_in_sdpa
+    undo = baseline_mod.force_baseline_kv_expansion()
+    try:
+        for lengths in ([24, 24, 24], [8, 15, 22]):
+            assert baseline_mod.baseline_expands_kv_for(
+                tiny_generator, _requests(lengths)
+            ) is True, f"the patch did not take for prompt lengths {lengths}"
+    finally:
+        undo()
+    assert sdpa_attention.use_gqa_in_sdpa is original, (
+        "force_baseline_kv_expansion leaked past its undo; a later Arm A run in "
+        "the same process would silently be Arm B"
+    )
+
+
+def test_force_expansion_raises_rather_than_silently_not_patching(monkeypatch):
+    """A patch that no-ops would make Arm B a second copy of Arm A.
+
+    That is the failure that looks like a clean result: two arms agreeing
+    perfectly because they were the same arm.
+    """
+    from transformers.integrations import sdpa_attention
+
+    from bench import baseline as baseline_mod
+
+    monkeypatch.delattr(sdpa_attention, "use_gqa_in_sdpa", raising=False)
+    with pytest.raises(RuntimeError, match="use_gqa_in_sdpa"):
+        baseline_mod.force_baseline_kv_expansion()
+
+
+def test_the_gate_refuses_a_baseline_whose_tokens_moved(tiny_generator):
+    """The gate must have teeth, so give it something to reject."""
+    from bench import baseline as baseline_mod
+
+    batches = [_requests([24, 24, 24]), _requests([8, 15, 22])]
+    evidence = baseline_mod.assert_token_identical(tiny_generator, batches)
+    assert evidence["token_identical"] is True
+    assert evidence["patch_verified_active"] is True
+    assert evidence["tokens_compared"] > 0
+
+    real = tiny_generator.generate_batch
+    seen = {"calls": 0}
+
+    def perturbed(batch):
+        output = real(batch)
+        seen["calls"] += 1
+        if seen["calls"] > len(batches):  # only the patched half is corrupted
+            key = next(iter(output))
+            output[key] = (output[key][0] + 1,) + tuple(output[key][1:])
+        return output
+
+    tiny_generator.generate_batch = perturbed
+    try:
+        with pytest.raises(baseline_mod.BaselineNotIdentical, match="diverged at token"):
+            baseline_mod.assert_token_identical(tiny_generator, batches)
+    finally:
+        tiny_generator.generate_batch = real

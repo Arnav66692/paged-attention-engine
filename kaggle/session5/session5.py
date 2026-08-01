@@ -221,9 +221,11 @@ def identify(q, k, v, **kw):
 from transformers import AutoModelForCausalLM
 from engine import attention as attn
 from engine.model import Qwen2Engine
-from engine.cache import BlockAllocator
-from engine.scheduler import ExecutionMode, Qwen2Executor, Request, Scheduler
+from engine.cache import ADMISSION_MARGIN_BLOCKS, BlockAllocator
+from engine.scheduler import ExecutionMode, Qwen2Executor, Scheduler
 from bench import workload
+from bench.run import _engine_requests
+from bench.workload import BLOCK_SIZE, NUM_GPU_BLOCKS
 model = AutoModelForCausalLM.from_pretrained(os.environ["MODEL"], dtype=torch.float16)
 model.eval(); model.to("cuda")
 engine = Qwen2Engine.from_hf_model(model)
@@ -237,20 +239,25 @@ def recording(q, k, v, *a, **kw):
                      "backends": identify(q, k, v, *a, **kw), "count": 0}
     seen[sig]["count"] += 1
     return REAL(q, k, v, *a, **kw)
+# The harness's own construction, not a hand-rolled copy of it.
 stream = workload.build_stream(os.environ["STREAM"], 0, 64)[:4]
-allocator = BlockAllocator(workload.NUM_GPU_BLOCKS, workload.BLOCK_SIZE)
+allocator = BlockAllocator(num_blocks=NUM_GPU_BLOCKS, block_size=BLOCK_SIZE)
 cache = engine.new_paged_cache(allocator.num_blocks, allocator.block_size)
-sched = Scheduler(allocator, Qwen2Executor(engine, cache), mode=ExecutionMode.FUSED)
-for r in stream:
-    sched.submit(Request(r.request_id, tuple(r.prompt_token_ids), r.max_new_tokens))
+scheduler = Scheduler(Qwen2Executor(engine, cache, allocator), allocator,
+                      mode=ExecutionMode.FUSED,
+                      admission_margin_blocks=ADMISSION_MARGIN_BLOCKS)
+for request in _engine_requests(stream):
+    scheduler.add_request(request)
 F.scaled_dot_product_attention = recording
 try:
-    for _ in range(6):
-        if not sched.step().batch_size: break
+    # A prefill step and a few decodes is every distinct shape the engine issues.
+    for _ in range(int(os.environ.get("STEPS", "6"))):
+        if not scheduler.step().batch_size: break
 finally:
     F.scaled_dot_product_attention = REAL
-print(json.dumps({"gqa_path": attn.GQA_PATH, "signatures": list(seen.values()),
-                  "backends": sorted({b for s in seen.values() for b in s["backends"]})}))
+print("PROBE_RESULT " + json.dumps(
+    {"gqa_path": attn.GQA_PATH, "signatures": list(seen.values()),
+     "backends": sorted({b for s in seen.values() for b in s["backends"]})}))
 ''')
 gate2b: dict = {}
 for gqa_path in ("sdpa", "repeat_kv"):
@@ -261,14 +268,17 @@ for gqa_path in ("sdpa", "repeat_kv"):
         done = subprocess.run([sys.executable, str(PROBE)], env=env,
                               capture_output=True, text=True, timeout=2400)
         line = next((ln for ln in reversed((done.stdout or "").splitlines())
-                     if ln.startswith("{")), None)
+                     if ln.startswith("PROBE_RESULT ")), None)
         if line:
-            gate2b[key] = json.loads(line)
+            gate2b[key] = json.loads(line[len("PROBE_RESULT "):])
             print(f"{key}: backends={gate2b[key]['backends']} "
                   f"({len(gate2b[key]['signatures'])} distinct shapes)", flush=True)
         else:
-            gate2b[key] = {"error": (done.stderr or "")[-600:]}
-            print(f"{key}: ERROR\n{(done.stderr or '')[-600:]}", flush=True)
+            err = "\n".join(
+                ln for ln in (done.stderr or "").splitlines()
+                if "it/s" not in ln and "Loading weights" not in ln)
+            gate2b[key] = {"error": err[-1500:]}
+            print(f"{key}: ERROR\n{err[-1500:]}", flush=True)
 report["gate2b_engine_backends"] = gate2b
 save()
 
