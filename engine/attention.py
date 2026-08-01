@@ -26,6 +26,7 @@ is one indexing op rather than a Python loop over blocks, but it is still O(seq)
 work per step that a fused kernel would avoid. Correctness first; no Triton.
 """
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Sequence
@@ -71,6 +72,29 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_kv_heads, seq_len, head_dim = x.shape
     expanded = x[:, :, None, :, :].expand(batch, num_kv_heads, n_rep, seq_len, head_dim)
     return expanded.reshape(batch, num_kv_heads * n_rep, seq_len, head_dim)
+
+
+# WHICH PATH GQA TAKES, and this is UNDER EVALUATION rather than settled.
+#
+#   "sdpa"       hand unexpanded K/V to SDPA with enable_gqa=True. Allocates
+#                nothing, but on sm_75 no fused kernel accepts it, so SDPA falls
+#                back to MATH.
+#   "repeat_kv"  materialise the expansion first. Costs the copy, but dispatches
+#                to EFFICIENT_ATTENTION.
+#
+# Given the SAME kernel the two are bit-exact; they are not the same kernel, so
+# this is not a free choice. The measurement that settles it is which backend the
+# HF BASELINE lands on -- engine on MATH against a baseline on EFFICIENT would be
+# a kernel comparison wearing paging as a disguise, with the handicap on our
+# side. See kaggle/session3 and docs/AMPERE_RECHECK.md.
+#
+# This switch is temporary. Once the decision is made it collapses to one value
+# and this comment goes with it.
+GQA_PATH = os.environ.get("PAGED_ATTENTION_GQA_PATH", "sdpa")
+if GQA_PATH not in ("sdpa", "repeat_kv"):
+    raise ValueError(
+        f"PAGED_ATTENTION_GQA_PATH must be 'sdpa' or 'repeat_kv', got {GQA_PATH!r}"
+    )
 
 
 def _causal_shortcut(num_query_tokens: int, past_len: int) -> bool:
@@ -135,6 +159,16 @@ def _sdpa(
     `bench/run.py` now records which backend runs. See
     `kaggle/session2` for the measurement that established this.
     """
+    if GQA_PATH == "repeat_kv" and num_kv_groups > 1:
+        return F.scaled_dot_product_attention(
+            query,
+            repeat_kv(keys, num_kv_groups),
+            repeat_kv(values, num_kv_groups),
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            scale=scale,
+            is_causal=is_causal,
+        )
     return F.scaled_dot_product_attention(
         query,
         keys,
