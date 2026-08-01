@@ -10,6 +10,8 @@ import json
 
 import pytest
 
+from pathlib import Path
+
 from bench import arms
 from bench.run import LevelResult, SPREAD_LIMIT
 
@@ -425,3 +427,73 @@ def test_a_cell_with_no_recorded_baseline_path_decides_nothing():
     assert comparison["num_deciding"] == 0
     assert comparison["cells_with_unrecorded_baseline_path"] == 1
     assert "UNDETERMINED" in comparison["kernel_bias"]["verdict"]
+
+
+# --- the arms must have done the same work ---------------------------------
+
+
+def _with_work(ratio, **overrides):
+    base = {"workload_digest": "abc", "engine_tokens": 131072,
+            "baseline_tokens": 131072, "engine_preemptions": 32,
+            "engine_peak_blocks": 3548, "engine_rejected": 0,
+            "baseline_rejected": 0, "baseline_max_resident": 18}
+    base.update(overrides)
+    return {**ratio, "work": base}
+
+
+def test_arms_that_did_different_work_are_not_comparable():
+    """A ratio shift is only a kernel effect once 'and nothing else' is checked.
+
+    The rect3072 cells passed this: identical tokens, preemptions, peak blocks,
+    rejections and workload digest across arms, with no provenance drift outside
+    the two knobs under test. That is what licenses reading +2.30% as the kernel.
+    A cell that does not clear it must not be read the same way.
+    """
+    for field, bad in (
+        ("workload_digest", "different-stream"),
+        ("engine_tokens", 130000),
+        ("engine_preemptions", 31),
+        ("baseline_rejected", 4),
+        ("baseline_max_resident", 32),
+    ):
+        comparison = arms.compare_arms(
+            {"cell": _with_work(_ratio(1.9, 2.0, 2.1))},
+            {"cell": _with_work(_ratio(1.9, 2.0, 2.1), **{field: bad})},
+        )
+        cell = comparison["cells"]["cell"]
+        assert cell["comparable"] is False, f"{field} differing was let through"
+        assert "DIFFERENT work" in cell["why"]
+        assert field in cell["why"], f"{field} not named in the refusal"
+    # And it must not quietly count as agreement.
+    assert comparison["num_deciding"] == 0
+    assert "UNDETERMINED" in comparison["kernel_bias"]["verdict"]
+
+
+def test_identical_work_still_compares_normally():
+    comparison = arms.compare_arms(
+        {"cell": _with_work(_ratio(1.90, 2.00, 2.10))},
+        {"cell": _with_work(_ratio(1.95, 2.05, 2.15))},
+    )
+    cell = comparison["cells"]["cell"]
+    assert cell["comparable"] is True
+    assert cell["kind"] == arms.BOTH_MOVED
+    assert cell["intervals_overlap"] is True
+
+
+def test_the_real_rect3072_results_clear_the_work_check(tmp_path):
+    """Drive the shipping join over the actual measured files, if present."""
+    import shutil
+
+    repo_root = Path(__file__).resolve().parent.parent
+    found = sorted(repo_root.glob("kaggle/session6?/arm[AB]-*.json"))
+    if len(found) < 2:
+        pytest.skip("no measured arm results in the tree")
+    for path in found:
+        shutil.copy2(path, tmp_path / path.name)
+
+    assert arms._compare_only(tmp_path) == 0
+    summary = json.loads((tmp_path / "arms_summary.json").read_text())
+    for name, cell in summary["comparison"]["cells"].items():
+        assert cell.get("comparable") is True, (
+            f"measured cell {name} failed the work check: {cell.get('why')}"
+        )

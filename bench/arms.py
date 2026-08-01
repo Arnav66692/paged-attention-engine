@@ -197,6 +197,21 @@ def ratio_for(payload: dict) -> dict | None:
         # Did Arm B move the BASELINE on this cell, or only the engine?
         "baseline_expands_kv_unpatched": provenance.get("baseline_expands_kv_unpatched"),
         "gqa_path": provenance.get("gqa_path"),
+        # WHAT THE RUN ACTUALLY DID. Two arms are only comparable if they did
+        # the same work; a ratio shift means "the kernel" only once "and nothing
+        # else" is established rather than assumed. Decoding is greedy and the
+        # workload contract is exact lengths, so every one of these is expected
+        # to match exactly across arms, and any that does not voids the cell.
+        "work": {
+            "workload_digest": provenance.get("workload_digest"),
+            "engine_tokens": engine.get("generated_tokens"),
+            "baseline_tokens": baseline.get("generated_tokens"),
+            "engine_preemptions": engine.get("preemption_count"),
+            "engine_peak_blocks": engine.get("peak_blocks_used"),
+            "engine_rejected": engine.get("num_rejected"),
+            "baseline_rejected": baseline.get("num_rejected"),
+            "baseline_max_resident": baseline.get("max_resident"),
+        },
         "engine_tps": {"low": e_lo, "median": e_med, "high": e_hi},
         "baseline_tps": {"low": b_lo, "median": b_med, "high": b_hi},
         # Worst case for the engine over best case for the baseline, and back.
@@ -259,6 +274,27 @@ def compare_arms(arm_a: dict, arm_b: dict) -> dict:
             cells[name] = {"comparable": False,
                            "why": "one or both arms did not resolve this cell"}
             continue
+        # THE CELL IS VOID IF THE ARMS DID DIFFERENT WORK. Everything downstream
+        # reads a ratio shift as a kernel effect, and that reading is only
+        # available once the two arms are known to have consumed the same
+        # stream, generated the same tokens, preempted the same number of times
+        # and rejected the same requests.
+        work_a, work_b = a.get("work") or {}, b.get("work") or {}
+        differing = {
+            key: (work_a.get(key), work_b.get(key))
+            for key in set(work_a) | set(work_b)
+            if work_a.get(key) != work_b.get(key)
+        }
+        if differing:
+            cells[name] = {
+                "comparable": False,
+                "why": (
+                    "the two arms did DIFFERENT work, so a ratio shift between "
+                    f"them is not attributable to the kernel: {differing}"
+                ),
+            }
+            continue
+
         overlap = a["ratio_low"] <= b["ratio_high"] and b["ratio_low"] <= a["ratio_high"]
         kind = _classify(a)
         cells[name] = {
