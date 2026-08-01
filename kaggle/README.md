@@ -83,3 +83,25 @@ Both would have burned a session.
 ```bash
 pytest tests/test_kaggle_session.py -m ""
 ```
+
+## Two GPU sessions at a time, and the slice boundary respects it
+
+`kaggle kernels push` refuses a third concurrent GPU kernel:
+
+```
+Kernel push error: Maximum batch GPU session count of 2 reached.
+```
+
+So the four `session6?` slices run two at a time. That is not a problem for the
+comparison, because **each slice already contains both arms** — Arm A and Arm B
+for a cell run back to back in the same session on the same physical T4, and the
+only thing split across hosts is different cells, which are never compared to
+each other.
+
+Pushing a new dataset version while kernels are running is safe: a kernel copies
+the repo out of the mounted dataset at startup and does not re-read it.
+
+Kaggle also renames an uploaded script to `script.py` before running it, so
+nothing may derive its identity from `__file__` — the session6 slices each
+declare their cell as a literal, checked against the directory name by
+`tests/test_bench.py`.
