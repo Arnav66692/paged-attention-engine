@@ -149,9 +149,19 @@ came from. It is not a hedge to be waved at; it is a measured term.
 
 **The `mixed` cells decide nothing about this** and must not be read as if they
 did. There HF's ragged batches already pre-expand, so Arm B's patch is inert on
-the baseline — measured rather than assumed: baseline 1249.92 s vs 1250.45 s
-across the arms, 0.04% apart. Only the engine moves, and it moves 2.01×. That
-prices the handicap Arm A was carrying, not kernel bias.
+the baseline — measured rather than assumed, on both cells:
+
+| cell | baseline Arm A | baseline Arm B | apart | engine A→B |
+|---|---|---|---|---|
+| `mixed-rect3072-C64` | 1249.92 s | 1250.45 s | 0.04% | 0.9409 → 1.8903 (2.01×) |
+| `mixed-rect1757-C64` | 1208.61 s | 1207.34 s | 0.10% | 0.9859 → 1.8968 (1.92×) |
+
+The baseline is invariant to within a tenth of a percent, which is what "inert"
+has to mean if it is to be claimed. Only the engine moves, and it roughly
+doubles. **That prices the handicap Arm A was carrying — the engine sitting on
+`MATH` while HuggingFace already held `EFFICIENT_ATTENTION` — and it is not
+evidence about kernel bias.** It is also the largest number in this experiment,
+and it was nobody's decision.
 
 **The procedure, kept runnable.** `python -m bench.arms` runs both arms;
 `--compare-only` joins slices measured in separate sessions. Arm B is **void
