@@ -18,10 +18,19 @@ published.**
 
 | stream | prompt lengths | result |
 |---|---|---|
-| `mixed` | 224 distinct, 40–2048 tokens | **1.89× – 2.06×**, winning at all three levels on both rectangle sizings |
+| `mixed` | 224 distinct, 40–2048 tokens | **1.89× – 2.06× in Arm B**, winning at all three levels on both sizings — but **0.94× and 0.99× in Arm A**, a loss |
 | `control` | all 512 tokens | **0.66× – 0.79×** — a loss, in both arms, at every sizing |
 
-Both numbers are real and the second one is the more informative.
+**Arm A loses `mixed` as well, and that belongs here rather than in a footnote:**
+0.9409× at `mixed-rect3072-C64` and 0.9859× at `mixed-rect1757-C64`. Arm A is the
+engine's *shipped default* (`PAGED_ATTENTION_GQA_PATH=sdpa`), and under it the
+engine sits on `MATH` while HF's ragged batches already hold
+`EFFICIENT_ATTENTION` — the asymmetry described below, priced. Arm A was run on
+`mixed` at `C=64` only; `C=32` and `C=87` are **unmeasured** under the default.
+
+So the win requires the engine to be on `repeat_kv`, which is not what it ships
+with today. Every number here is real, and the ones that are not wins are the
+more informative.
 
 ---
 
@@ -125,7 +134,7 @@ Arm B's patch only bites where HF would otherwise have taken `enable_gqa`. On
 `mixed` it is inert, so **only the `control` cells can answer whether the shared
 kernel biases the ratio** — those are the only ones where both sides moved.
 
-### Kernel bias: bounded at ~5%, and the sign is not constant
+### Kernel bias: −4.77% and +2.30% at the two cells that can decide it, sign not constant
 
 | deciding cell | baseline resident | Arm A (`MATH`) | Arm B (`EFFICIENT`) | shift |
 |---|---|---|---|---|
@@ -134,8 +143,11 @@ kernel biases the ratio** — those are the only ones where both sides moved.
 
 Intervals do not overlap either time, and both arms did provably identical work
 (same tokens, preemptions, peak blocks, rejections, workload digest). So the
-disagreement is real: **the kernel moves the ratio by at most ~5%, and which way
-depends on the configuration.** It follows whichever side gains more from the
+disagreement is real: **at the two configurations able to decide this, the kernel
+moved the ratio by −4.77% and +2.30%, and which way it moves depends on the
+configuration.** These are the only two deciding cells that exist — `control` was
+never run at `C=32` or `C=87` — so the magnitude at any other configuration is
+**unmeasured**, and no general bound is claimed. It follows whichever side gains more from the
 switch — engine 1.662× vs baseline 1.625× at resident 18 (ratio up), engine
 1.749× vs baseline 1.836× at resident 32 (ratio down).
 
@@ -172,11 +184,13 @@ of the highest in the matrix. Residency parity is not throughput parity.
 
 **So residency is not the mechanism, and it cannot be in either direction:** the
 engine also *loses* the control stream at `C=64` while holding roughly 55
-sequences against the baseline's 18 — the largest residency advantage anywhere
-in this matrix. (Derived, not directly recorded: peak blocks held was **3548**,
+sequences against the baseline's 18, roughly a 3× residency advantage. (Derived,
+not directly recorded: peak blocks held was **3548**,
 measured, and a control request is 512 + 512 tokens ÷ `BLOCK_SIZE` 16 = 64
-blocks, so 3548 / 64 ≈ 55.4.) What separates a win from a loss is **the shape of
-the stream, not the size of the running set.** Ragged lengths mean a static batch is held by its
+blocks, so 3548 / 64 ≈ 55.4.) That is a smaller advantage than `mixed-rect3072-C87`
+enjoys — cap 87 against 18, 4.8× — but the control cell loses while the mixed one
+wins by 2×. What separates a win from a loss is **the shape of the stream, not the
+size of the running set.** Ragged lengths mean a static batch is held by its
 longest member; that waste is what continuous batching removes, and it is present
 at equal residency. Uniform lengths mean there is no such waste at any residency.
 

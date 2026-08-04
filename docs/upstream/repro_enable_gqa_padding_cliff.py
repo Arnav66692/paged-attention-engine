@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone reproduction: on sm < 80, PADDING A BATCH MAKES HUGGINGFACE FASTER.
+"""Standalone reproduction: on sm < 80, HuggingFace's no-padding path is the SLOW one.
 
 Depends on nothing but torch + transformers. Copy this file anywhere and run it.
 
@@ -19,8 +19,16 @@ NOT (sm < 80: T4, V100, RTX 20xx, GTX 16xx), torch's SDPA cannot honour
 would have run, and does run, as soon as K/V are pre-expanded.
 
 The consequence is inverted from what anyone would guess: a batch of
-EQUAL-LENGTH prompts takes the slow kernel, and adding one shorter prompt --
-which forces a mask, which makes HF pre-expand -- takes the fast one.
+EQUAL-LENGTH prompts takes the SLOW kernel, because no padding means no mask
+means `enable_gqa`. A ragged batch forces a mask, so HF pre-expands, so it takes
+the fast one.
+
+WHAT THIS SCRIPT DOES AND DOES NOT MEASURE. It holds ONE uniform batch fixed and
+flips `use_gqa_in_sdpa` to force the other path, so both timings do byte-for-byte
+identical work and the delta is attributable to the kernel alone. It does NOT
+time a ragged batch against a uniform one -- those would be different workloads
+and the comparison would prove nothing. The ragged case is covered by the
+backend readout, which shows which path HF takes for each.
 
 WHAT IT PRINTS
 
@@ -207,10 +215,14 @@ def main() -> int:
               "there is no cliff here. Expected on sm >= 80, where FLASH can "
               "honour enable_gqa.")
     else:
-        print(f"\n  The only difference is the K/V input SHAPE. HuggingFace picks "
-              f"the first form whenever attention_mask is None -- i.e. whenever "
-              f"nothing was padded -- so on this device an UNPADDED batch is "
-              f"{slow[0] / fast[0]:.2f}x SLOWER than the same batch padded.")
+        print(f"\n  Both timings above ran the SAME uniform batch; the only "
+              f"difference is the K/V input shape, forced by the monkeypatch. "
+              f"HuggingFace picks the first form whenever attention_mask is None "
+              f"-- i.e. whenever nothing was padded -- so on this device the "
+              f"no-padding case is the {slow[0] / fast[0]:.2f}x SLOWER one. A "
+              f"genuinely ragged batch would take the fast path here, but it "
+              f"would also be different work, which is why this script holds the "
+              f"batch fixed and flips the flag instead.")
     return 0
 
 

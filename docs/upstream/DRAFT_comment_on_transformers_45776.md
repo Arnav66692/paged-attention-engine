@@ -54,7 +54,7 @@ is the regime the gating change is meant to protect and the one with no data.
 >
 > | batch shape | as shipped | K/V pre-expanded | speedup |
 > |---|---|---|---|
-> | 18 resident | 177.8 tok/s | 288.9 tok/s | **1.63×** |
+> | 18 resident | 177.8 tok/s | 288.9 tok/s | **1.62×** |
 > | 32 resident | 202.0 tok/s | 370.9 tok/s | **1.84×** |
 >
 > Identical work in both columns — same prompts, same token counts, greedy,
@@ -64,8 +64,9 @@ is the regime the gating change is meant to protect and the one with no data.
 > MATH expands K/V for its matmul anyway and materialises the score matrix on
 > top, so the allocation-free path is neither.
 >
-> **The part I think is worth calling out separately.** `use_gqa_in_sdpa()`
-> returns `True` exactly when `attention_mask is None`, which for `generate()`
+> **The part I think is worth calling out separately.** On CUDA with torch >= 2.5,
+> `use_gqa_in_sdpa()` returns `True` exactly when `attention_mask is None`, which
+> for `generate()`
 > means exactly when nothing was left-padded. So on sm < 80 the consequence is
 > inverted from what a user would ever guess:
 >
@@ -95,11 +96,11 @@ is the regime the gating change is meant to protect and the one with no data.
 |---|---|
 | backends selected, both K/V forms | `kaggle/session5` gate 2, `kaggle/session3` |
 | FLASH/CUDNN reject every shape on sm_75 | `docs/AMPERE_RECHECK.md` item 2 |
-| 1.63× / 1.84× end to end | `bench/results/arms/arm{A,B}-control-rect{3072,1757}-C64.json`, baseline levels |
+| 1.62× / 1.84× end to end | `bench/results/arms/arm{A,B}-control-rect{3072,1757}-C64.json`, baseline levels |
 | 2.76×–5.67× per attention call; 3.3×–8.3× transient | `kaggle/session4/session4_report.json` |
 | `use_gqa_in_sdpa` returns True iff mask is None | transformers 5.12.1 and `main`, verified 2026-08 |
 
-Every figure is from a run that happened. The 1.63×/1.84× pair are **baseline
+Every figure is from a run that happened. The 1.62×/1.84× pair are **baseline
 levels only** — the paged engine is not part of this comparison and should not
 be mentioned upstream; it is the HuggingFace baseline measured against itself
 with one boolean flipped.
