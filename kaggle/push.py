@@ -41,8 +41,17 @@ PLACEHOLDER = "KAGGLE_USERNAME"
 # What the engine needs to run its tests, and nothing else. No .git (large, and
 # the kernel has no use for history), no .venv (macOS arm64 wheels would be
 # actively harmful on a CUDA host), no caches.
-REPO_INCLUDE = ("engine", "bench", "tests", "conftest.py", "pytest.ini",
+# `docs` is here because tests read it. `tests/test_ampere_recheck.py` asserts
+# docs/AMPERE_RECHECK.md exists and still lists every device-dependent item, so
+# omitting the directory made all 16 of its tests fail on the measurement host
+# -- including "the list exists" -- for the whole time the full suite had never
+# been run there. A test that reads a file needs that file shipped.
+REPO_INCLUDE = ("engine", "bench", "tests", "docs", "conftest.py", "pytest.ini",
                 "requirements.txt")
+# Copied if present, skipped if not. CLAUDE.md is gitignored, so it exists on a
+# clone but not in a worktree; test_claude_md_points_at_the_list reads it and
+# would otherwise fail on the measurement host for a reason that is not a bug.
+REPO_INCLUDE_OPTIONAL = ("CLAUDE.md",)
 REPO_EXCLUDE = shutil.ignore_patterns(
     "__pycache__", "*.pyc", ".pytest_cache", ".venv", ".git", "_build", "results",
     "plots",
@@ -106,9 +115,12 @@ def stage(username: str, session: str) -> tuple[Path, Path]:
     # The repo snapshot the kernel will import.
     payload = dataset_dir / "repo"
     payload.mkdir()
-    for name in REPO_INCLUDE:
+    for name in REPO_INCLUDE + REPO_INCLUDE_OPTIONAL:
         source = REPO_ROOT / name
         if not source.exists():
+            if name in REPO_INCLUDE_OPTIONAL:
+                print(f"  note: {name} absent, shipping without it")
+                continue
             raise RuntimeError(f"{source} is missing; the dataset would be incomplete")
         if source.is_dir():
             shutil.copytree(source, payload / name, ignore=REPO_EXCLUDE)
