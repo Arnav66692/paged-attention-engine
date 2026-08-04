@@ -39,6 +39,9 @@ REQUIRED_ITEMS = {
     "symmetry_is_not_neutrality": r"[Ss]ymmetry is not neutrality|"
                                   r"[Ss]ymmetry.{0,40}not.{0,20}neutral",
     "enable_gqa_memory_claim": r"memory saving does not exist",
+    # Measured in session8, the first run of the full default suite on the
+    # measurement host. The two GQA paths are NOT bit-identical on sm_75.
+    "gqa_bit_equality_fails_on_cuda": r"NOT bit-identical to `repeat_kv` on CUDA",
 }
 
 

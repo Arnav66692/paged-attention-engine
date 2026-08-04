@@ -85,8 +85,11 @@ reproduced on CPU in `tests/test_arms.py`.
 while the engine's masked fused call stays on `MATH` — an asymmetry **against**
 the engine that nobody chose and that was invisible until it was measured.
 
-That is why `sdpa` is the default — it matches on the stream the headline is
-quoted from — and it is **not** a memory saving; see item 6.
+That asymmetry is why `sdpa` **was** the default: it matched on the stream the
+headline was quoted from. **It no longer is.** A shipped engine has no baseline
+to stay level with, and `repeat_kv` is faster and lighter, so `repeat_kv` ships
+and the headline is now the shipping configuration against unpatched
+HuggingFace. `sdpa` was never a memory saving either; see item 6.
 
 ### Symmetry is not neutrality — MEASURED, and the SIGN IS NOT CONSTANT
 
@@ -236,3 +239,59 @@ MATH expands K/V for its matmul anyway and materialises the score matrix on top.
 baseline takes. **This is device-dependent** — it is a fact about which backend
 `enable_gqa` selects, and on Ampere that selection moves. Re-measure with
 `kaggle/session4` before repeating the memory claim either way.
+
+---
+
+## 7. `enable_gqa` is NOT bit-identical to `repeat_kv` on CUDA — the equality claim is false on sm_75
+
+`tests/test_attention_gqa.py` asserts `torch.equal` between the two GQA paths
+given identical inputs. **On the T4 that assertion fails**, for the two shapes
+that actually expand:
+
+| shape | cpu | mps | **cuda (sm_75)** |
+|---|---|---|---|
+| `headline-6x` 12q/2kv/128 | equal | equal | **NOT equal** |
+| `parity-model-7x` 14q/2kv/64 | equal | equal | **NOT equal** |
+| `no-expansion-1x` 4q/4kv/32 | equal | equal | equal |
+
+Both masked and causal. The `1x` case passes because `num_kv_groups == 1`, so
+`enable_gqa` is not passed and the two paths are literally the same call.
+
+**This is the same mechanism as everything else in item 2, arriving where it was
+not expected.** The two paths present different input SHAPES, torch selects
+`MATH` for one and `EFFICIENT_ATTENTION` for the other, and the two kernels
+accumulate in different orders. Bit-equality was never going to survive that.
+The file's own docstring said the claim was "verified equal, not merely close,
+masked and causal, **on cpu and mps**" — it knew CUDA was unverified, and the
+verification, when it finally ran, disagreed.
+
+**It is independent of `GQA_PATH`.** That test calls both paths explicitly and
+fails whatever the engine's default is. It did not appear when the default moved
+to `repeat_kv`; it appeared because **`kaggle/session8` is the first time the
+full default suite was ever run on the measurement host** — session 0 ran
+`--fast` and `-m slow` only, so the non-slow, non-fast half of the gate had only
+ever run on cpu and mps.
+
+**What this does NOT threaten.** All three declared tolerances passed on CUDA
+under the shipped `repeat_kv` default: `LOGIT_ATOL` (fp32, 31 passed),
+`FP16_LOGIT_ATOL` (9 passed), `FUSED_LOGIT_ATOL` (22 passed), plus the slow half
+(8 passed, 1 skipped). Parity holds. What fails is a *stricter-than-parity*
+equality claim about two paths, only one of which the engine now uses.
+
+**Left failing deliberately, not patched.** The rule in this repo is that a
+tolerance is never widened to make a test pass, and the equivalent here would be
+swapping `torch.equal` for an `allclose`. That would convert a measured device
+fact into a hidden one. The options, for whoever picks this up:
+
+1. **Pin the backend on both sides** (`sdpa_kernel(MATH)` for both) and keep
+   `torch.equal`. This tests the claim actually being made — that the
+   *expansion* is exact — with the kernel confound removed. Strictly better,
+   and not a widening.
+2. Restrict the assertion to devices where both shapes select the same backend,
+   and record the selected backends as the measurement.
+3. Leave it failing on CUDA as a standing reminder.
+
+**To re-measure on Ampere.** FLASH may accept `enable_gqa` on sm_80+, in which
+case both paths could land on the same backend and equality might hold again.
+That would make this item disappear on that device and reappear on this one,
+which is precisely why it is on this list.
