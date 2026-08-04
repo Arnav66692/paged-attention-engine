@@ -32,6 +32,8 @@ The full parity matrix on CUDA is re-verified separately, on the GPU, because
 this file cannot see a device it does not have.
 """
 
+from pathlib import Path
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -145,3 +147,51 @@ def test_a_one_to_one_ratio_needs_no_expansion_at_all():
     """num_kv_groups == 1 is a no-op both ways, and enable_gqa is not passed."""
     source = torch.randn(2, 4, 8, 16)
     assert repeat_kv(source, 1) is source
+
+
+# --- the shipped default ---------------------------------------------------
+
+
+def test_the_shipped_default_is_repeat_kv():
+    """`repeat_kv` ships. This is a performance choice with a measured basis.
+
+    It was `sdpa` for the whole benchmark, chosen for SYMMETRY against an HF
+    baseline that session 3 measured on MATH. Session 5 showed that symmetry was
+    an artifact of the prompt-uniform batch session 3 probed: HF takes
+    `enable_gqa` only when `attention_mask is None`, so on a ragged stream the
+    baseline already holds EFFICIENT_ATTENTION and the engine on `sdpa` was
+    carrying a ~2x handicap nobody chose.
+
+    A shipped engine has no baseline to stay level with, so the only question is
+    which kernel is faster and lighter. `repeat_kv` is both: 2.76-5.67x per call
+    and 3.3-8.3x less transient memory (kaggle/session4). The benchmark is
+    unaffected -- `bench/arms.py` sets the path explicitly per arm.
+
+    Pinned because a silent revert would change every kernel this engine issues
+    while every equality test kept passing: the two paths are `torch.equal` given
+    identical inputs, so equality cannot detect the swap. Only this can.
+    """
+    import os
+
+    from engine import attention
+
+    assert "PAGED_ATTENTION_GQA_PATH" not in os.environ, (
+        "this test reads the DEFAULT, so it cannot run with the override set"
+    )
+    assert attention.GQA_PATH == "repeat_kv", (
+        f"the shipped GQA path is {attention.GQA_PATH!r}. If this moved back to "
+        "'sdpa', note that on sm_75 that is the MATH path -- slower per call and "
+        "heavier in transient memory, because MATH expands K/V for its matmul "
+        "anyway and materialises the score matrix on top."
+    )
+
+
+def test_both_paths_remain_selectable_and_the_reference_is_not_deleted():
+    """`sdpa` stays reachable: bench/arms.py turns this knob, and it is the
+    reference the equality tests above are asserted against."""
+    from engine import attention
+
+    assert callable(attention.repeat_kv)
+    source = Path(attention.__file__).read_text()
+    for path in ("repeat_kv", "sdpa"):
+        assert f'"{path}"' in source, f"the {path!r} path is no longer selectable"

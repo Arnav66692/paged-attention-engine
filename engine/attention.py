@@ -74,26 +74,37 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     return expanded.reshape(batch, num_kv_heads * n_rep, seq_len, head_dim)
 
 
-# WHICH PATH GQA TAKES, and this is UNDER EVALUATION rather than settled.
+# WHICH PATH GQA TAKES. SETTLED: `repeat_kv` ships.
 #
+#   "repeat_kv"  materialise the expansion first. Costs the copy, dispatches to
+#                EFFICIENT_ATTENTION. THE DEFAULT.
 #   "sdpa"       hand unexpanded K/V to SDPA with enable_gqa=True. Allocates
-#                nothing, but on sm_75 no fused kernel accepts it, so SDPA falls
-#                back to MATH.
-#   "repeat_kv"  materialise the expansion first. Costs the copy, but dispatches
-#                to EFFICIENT_ATTENTION.
+#                nothing itself, but on sm_75 no fused kernel accepts it, so SDPA
+#                falls back to MATH -- which then expands K/V for its matmul
+#                anyway AND materialises the score matrix, costing MORE memory,
+#                not less. Retained for `bench/arms.py` and as the reference.
 #
-# Given the SAME kernel the two are bit-exact; they are not the same kernel, so
-# this is not a free choice. The measurement that settles it is which backend the
-# HF BASELINE lands on -- engine on MATH against a baseline on EFFICIENT would be
-# a kernel comparison wearing paging as a disguise, with the handicap on our
-# side. See kaggle/session3, kaggle/session5 and docs/AMPERE_RECHECK.md.
+# Given the SAME kernel the two are bit-exact, so this is a performance choice
+# and nothing else. `tests/test_attention_gqa.py` holds them to `torch.equal`.
 #
-# This switch is NOT temporary any more. It is the knob `bench/arms.py` turns to
-# run the same sweep under both kernels, because the baseline's own kernel turns
-# out to depend on whether the stream's prompts are uniform -- so no single
-# setting is symmetric on both streams, and which way that biases the ratio is
-# a measurement rather than a choice.
-GQA_PATH = os.environ.get("PAGED_ATTENTION_GQA_PATH", "sdpa")
+# WHY THE DEFAULT MOVED, having been `sdpa` through the whole benchmark.
+# `sdpa` was chosen for SYMMETRY: session 3 measured the HF baseline on MATH and
+# matching it kept the Gate 1 ratio from becoming a kernel comparison. Session 5
+# then showed that symmetry was an artifact of the batch session 3 happened to
+# probe. HF takes `enable_gqa` only when `attention_mask is None`, i.e. only when
+# nothing was left-padded, so on a RAGGED stream the baseline already holds
+# EFFICIENT_ATTENTION and the engine on `sdpa` was handicapped by roughly 2x by a
+# choice nobody made.
+#
+# For a SHIPPED engine the benchmark-symmetry argument does not apply: there is
+# no baseline to stay level with, and the only question is which kernel is faster
+# and lighter. `repeat_kv` is both -- 2.76-5.67x faster per call and 3.3-8.3x
+# lighter in transient memory (`kaggle/session4`).
+#
+# The benchmark is unaffected: `bench/arms.py` sets this explicitly per arm, and
+# Arm B already measured exactly this configuration on both streams. No sweep was
+# re-run to justify the change and none was needed.
+GQA_PATH = os.environ.get("PAGED_ATTENTION_GQA_PATH", "repeat_kv")
 if GQA_PATH not in ("sdpa", "repeat_kv"):
     raise ValueError(
         f"PAGED_ATTENTION_GQA_PATH must be 'sdpa' or 'repeat_kv', got {GQA_PATH!r}"
