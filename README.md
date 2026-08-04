@@ -338,6 +338,27 @@ issues on sm_75, so backend selection will move on Ampere; and the kernel-bias
 result above is a fact about which backend `enable_gqa` selects, which changes
 with the device. `tests/test_ampere_recheck.py` fails if any item is dropped.
 
+Item 7 is why `pytest` on a CUDA host shows **four `xfail`s**: on sm_75 the two
+GQA paths dispatch to different backends — `MATH` and `EFFICIENT_ATTENTION` —
+which accumulate in different orders, so `torch.equal` between them was never
+available there. `torch.equal` is kept and the cases are marked
+`xfail(strict=True)` with the mechanism in the reason, so an XPASS fails too and
+the fact cannot rot the day the dispatch changes. Swapping in `allclose` would
+have made the suite green by hiding a property of the hardware.
+
+---
+
+## Lessons
+
+- **A verification step must state which selection it ran.** The full default
+  suite first ran on the measurement host at **Session 8** — Session 0's "port
+  verification" ran `--fast` and `-m slow`, and neither selection covers the
+  middle, so the non-slow non-fast half of the gate had only ever run on cpu and
+  mps. That is where the four CUDA `xfail`s had been hiding. Same shape as
+  `_devices()` returning `["cpu"]` on a CUDA host: a step that reports "the
+  suite passed" says nothing without naming the selection, and both times the
+  gap was invisible precisely because something green was being reported.
+
 ---
 
 ## Scope

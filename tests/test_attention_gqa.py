@@ -6,8 +6,14 @@ but the `reshape` after it cannot be.
 
 `enable_gqa=True` makes SDPA broadcast internally instead. That is a change to
 the kernel path, so it is held to the strictest bar available: not "within a
-tolerance" but `torch.equal`. If the two ever stop being bit-identical on some
-device, this fails and the fused/parity tolerances are not asked to absorb it.
+tolerance" but `torch.equal`.
+
+AND ON CUDA IT DOES NOT HOLD. Measured on a T4 in `kaggle/session8`: where the
+two paths dispatch to different backends they cannot be bit-identical, and on
+sm_75 they do. Those cases are `xfail(strict=True)` with the mechanism in the
+marker -- NOT `allclose`, which would make the suite green by hiding a property
+of the hardware. `strict=True` means an XPASS fails too, so if the dispatch ever
+changes the fact cannot rot silently. `docs/AMPERE_RECHECK.md` item 7 owns it.
 
 THE SWITCH WAS MADE FOR MEMORY AND THAT REASON WAS WRONG. This file measures
 what `repeat_kv` allocates and concluded the switch saved it. It never measured
@@ -53,6 +59,43 @@ GQA_SHAPES = (
 )
 SEED = 0
 
+# THE ONE DEVICE FACT THAT DEFEATS BIT-EQUALITY, stated in the marker rather
+# than hidden behind a loosened comparison.
+#
+# `torch.equal` STAYS. The alternative -- swapping it for `allclose` -- would
+# make the suite green by concealing a measured property of the hardware.
+# `xfail(strict=True)` says the opposite: this is expected to fail HERE, for
+# this reason, and if it ever starts passing THAT is a failure too, because it
+# means the dispatch changed and item 7 needs re-measuring.
+CUDA_DISPATCH_DIVERGENCE = (
+    "enable_gqa and repeat_kv are NOT bit-identical on a device where the two "
+    "paths dispatch differently. They present different input SHAPES -- "
+    "unexpanded K/V with enable_gqa=True versus pre-expanded K/V -- and torch "
+    "selects MATH for the first and EFFICIENT_ATTENTION for the second. The two "
+    "kernels accumulate in different orders, so bit-equality was never available "
+    "here; it holds on cpu and mps, where both shapes reach the same kernel. "
+    "Measured on a Kaggle T4 sm_75 in kaggle/session8, the first run of the full "
+    "default suite on the measurement host. torch.equal is deliberately kept -- "
+    "allclose would hide this. strict=True: an XPASS means the dispatch moved "
+    "and docs/AMPERE_RECHECK.md item 7 must be re-measured. On sm_80+ FLASH may "
+    "accept enable_gqa, in which case both paths could land on one backend and "
+    "this is expected to XPASS."
+)
+
+
+def _expect_cuda_divergence(request, device, groups):
+    """Mark the known sm_75 dispatch divergence, and ONLY where it applies.
+
+    Not blanket-applied to CUDA: at `groups == 1` the engine does not pass
+    `enable_gqa` at all, so both paths are literally the same call and equality
+    holds on every device. Marking that case would claim a failure that does not
+    exist and `strict=True` would then fail it for passing.
+    """
+    if device == "cuda" and groups > 1:
+        request.applymarker(
+            pytest.mark.xfail(strict=True, reason=CUDA_DISPATCH_DIVERGENCE)
+        )
+
 
 def _kernels(device, num_heads, num_kv_heads, head_dim, query_len, kv_len):
     torch.manual_seed(SEED)
@@ -66,10 +109,11 @@ def _kernels(device, num_heads, num_kv_heads, head_dim, query_len, kv_len):
 @pytest.mark.parametrize("device", model_devices())
 @pytest.mark.parametrize("num_heads,num_kv_heads,head_dim", GQA_SHAPES)
 def test_enable_gqa_is_bit_identical_to_repeat_kv_with_a_mask(
-    device, num_heads, num_kv_heads, head_dim
+    request, device, num_heads, num_kv_heads, head_dim
 ):
     """The fused path's shape: an explicit boolean mask, no causal shortcut."""
     groups = num_heads // num_kv_heads
+    _expect_cuda_divergence(request, device, groups)
     query, keys, values = _kernels(device, num_heads, num_kv_heads, head_dim, 5, 9)
 
     mask = torch.zeros(3, 1, 5, 9, dtype=torch.bool, device=device)
@@ -97,10 +141,11 @@ def test_enable_gqa_is_bit_identical_to_repeat_kv_with_a_mask(
 @pytest.mark.parametrize("device", model_devices())
 @pytest.mark.parametrize("num_heads,num_kv_heads,head_dim", GQA_SHAPES)
 def test_enable_gqa_is_bit_identical_to_repeat_kv_when_causal(
-    device, num_heads, num_kv_heads, head_dim
+    request, device, num_heads, num_kv_heads, head_dim
 ):
     """The single-sequence backends' shape: SDPA's is_causal shortcut."""
     groups = num_heads // num_kv_heads
+    _expect_cuda_divergence(request, device, groups)
     query, keys, values = _kernels(device, num_heads, num_kv_heads, head_dim, 7, 7)
 
     expanded = F.scaled_dot_product_attention(
@@ -198,3 +243,81 @@ def test_both_paths_remain_selectable_and_the_reference_is_not_deleted():
     source = Path(attention.__file__).read_text()
     for path in ("repeat_kv", "sdpa"):
         assert f'"{path}"' in source, f"the {path!r} path is no longer selectable"
+
+
+def test_the_divergence_marker_applies_exactly_where_the_divergence_is():
+    """The xfail must be narrow, and it cannot be checked on a host without CUDA.
+
+    `strict=True` cuts both ways: marking a case that actually passes turns an
+    XPASS into a failure. So the predicate has to be exactly right, and on a
+    development machine the CUDA branch never executes. This drives the
+    predicate directly with a recording stub.
+    """
+    applied: list = []
+
+    class _Request:
+        def applymarker(self, marker):
+            applied.append(marker)
+
+    cases = {
+        ("cuda", 6): True,    # headline-6x     -- MATH vs EFFICIENT, diverges
+        ("cuda", 7): True,    # parity-model-7x -- same
+        ("cuda", 1): False,   # no-expansion-1x -- enable_gqa not passed at all
+        ("cpu", 6): False,    # both shapes reach the same kernel
+        ("mps", 6): False,
+        ("cpu", 1): False,
+    }
+    for (device, groups), expected in cases.items():
+        applied.clear()
+        _expect_cuda_divergence(_Request(), device, groups)
+        assert bool(applied) is expected, (
+            f"device={device!r} groups={groups}: marker applied={bool(applied)}, "
+            f"expected {expected}. Marking a passing case makes strict=True fail "
+            "it for succeeding; leaving a failing case unmarked makes the suite red."
+        )
+        if expected:
+            marker = applied[0]
+            assert marker.kwargs["strict"] is True, (
+                "strict=False would let the fact rot silently the day the "
+                "dispatch changes"
+            )
+            reason = marker.kwargs["reason"]
+            for mechanism in ("MATH", "EFFICIENT_ATTENTION", "accumulate",
+                              "SHAPES", "AMPERE_RECHECK"):
+                assert mechanism in reason, (
+                    f"the xfail reason does not carry {mechanism!r}. The reason "
+                    "IS the documentation here -- a bare xfail would hide the "
+                    "device fact exactly as allclose would."
+                )
+
+
+def test_no_gqa_test_was_quietly_switched_to_allclose():
+    """torch.equal is the bar. Loosening it is the failure mode xfail avoids.
+
+    Checked against the AST, not the text: this file DISCUSSES allclose at
+    length in order to explain why it is not used, so a substring search would
+    flag its own documentation.
+    """
+    import ast
+
+    tree = ast.parse(Path(__file__).read_text())
+    loosened = [
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr in ("allclose", "isclose")
+    ]
+    assert not loosened, (
+        f"an equality assertion in this file was relaxed to {loosened}. That "
+        "makes the suite green by hiding which kernel ran; use "
+        "xfail(strict=True) with the mechanism in the reason instead."
+    )
+    equals = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "equal"
+    ]
+    assert len(equals) >= 4, (
+        f"only {len(equals)} torch.equal calls remain; the bit-equality claims "
+        "are the point of this file"
+    )
