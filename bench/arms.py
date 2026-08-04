@@ -93,6 +93,42 @@ CELLS = tuple(
 )
 
 
+# GAP FILL. The gate wants a win at three or more levels, and only arm B mixed
+# wins, so extra levels go there alone. C=32 and C=87 -- NOT lower.
+#
+# The reason is the baseline's residency rule: `max_resident` is
+# min(rectangle limit, C). Below the rectangle cap BOTH engines are capped
+# identically by C, the engine has no residency advantage left, and the level
+# would buy a loss that says nothing about paging. Above it the engine keeps
+# admitting and the baseline cannot:
+#
+#   rect3072  C=32 engine 32 vs baseline 18   C=64  64/18   C=87  87/18
+#   rect1757  C=32 engine 32 vs baseline 32   C=64  64/32   C=87  87/32
+#                       ^^ tied -- THE CROSSOVER
+#
+# rect1757 at C=32 sits exactly on the cap with both sides at 32 resident. A
+# loss or a tie is the EXPECTED result there and it is the point that shows the
+# mechanism, not a failure. It is reported as the crossover.
+GAP_FILL_CELLS = tuple(
+    {
+        "stream": "mixed",
+        "rectangle": rectangle,
+        "headline": False,
+        "concurrency": concurrency,
+        "arms": ("B",),        # arm A mixed is asymmetric; it may not be timed here
+    }
+    for concurrency in (32, 87)
+    for rectangle in baseline_mod.RECTANGLE_SIZINGS
+)
+
+ALL_CELLS = CELLS + GAP_FILL_CELLS
+
+
+def arms_for(cell: dict) -> tuple:
+    """Which arms this cell may be run under. Default both."""
+    return tuple(cell.get("arms") or sorted(ARMS))
+
+
 def cell_name(cell: dict) -> str:
     return f"{cell['stream']}-rect{cell['rectangle']}-C{cell['concurrency']}"
 
@@ -424,10 +460,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _compare_only(args.out_dir)
 
     arms = args.arm or sorted(ARMS)
-    cells = [c for c in CELLS if not args.cell or cell_name(c) in args.cell]
+    cells = [c for c in ALL_CELLS if not args.cell or cell_name(c) in args.cell]
     if not cells:
         print(f"no cells matched {args.cell}; known: "
-              f"{[cell_name(c) for c in CELLS]}", file=sys.stderr)
+              f"{[cell_name(c) for c in ALL_CELLS]}", file=sys.stderr)
         return 2
     args.out_dir.mkdir(parents=True, exist_ok=True)
     extra = ["--smoke"] if args.smoke else []
@@ -436,6 +472,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     identity: dict[str, dict] = {}
     for arm in arms:
         for cell in cells:
+            if arm not in arms_for(cell):
+                print(f"skipping arm {arm} for {cell_name(cell)}: this cell "
+                      f"declares arms={arms_for(cell)}", flush=True)
+                continue
             path = run_cell(arm, cell, args.out_dir, extra)
             payload = json.loads(path.read_text())
             ratios[arm][cell_name(cell)] = ratio_for(payload)

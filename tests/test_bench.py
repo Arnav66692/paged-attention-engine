@@ -655,56 +655,102 @@ def test_provenance_records_sdpa_backends_and_allocator_conf():
 def test_every_arm_cell_is_assigned_to_exactly_one_kaggle_slice():
     """A cell with no slice never runs, and a matrix with a hole reads as full.
 
-    The four session6 kernels are identical files that pick their cell from
-    their own filename. That is only safe while the table and the matrix agree,
-    and they live in different files.
+    Two families of kernels, both picking their work from a declared literal
+    because Kaggle renames an uploaded script to script.py and a derived
+    identity would refuse to start on the measurement host:
+
+      session6?  the primary matrix, one cell each, both arms
+      session7?  the gap-fill levels, a LIST of cells each, arm B only
+
+    The tables live in different files from the matrix they must agree with.
     """
     import ast
 
-    from bench.arms import CELLS, cell_name
+    from bench.arms import ALL_CELLS, CELLS, GAP_FILL_CELLS, cell_name
 
     repo_root = Path(__file__).resolve().parent.parent
-    slices = None
-    for candidate in sorted((repo_root / "kaggle").glob("session6?/session6?.py")):
-        for node in ast.walk(ast.parse(candidate.read_text())):
-            if (isinstance(node, ast.Assign)
-                    and getattr(node.targets[0], "id", "") == "SLICES"):
-                table = ast.literal_eval(node.value)
-                assert slices is None or table == slices, (
-                    f"{candidate.name} carries a different slice table; the "
-                    "four kernels must be identical copies"
-                )
-                slices = table
-    if slices is None:
-        pytest.skip("session6 slices not present")
 
-    assigned = list(slices.values())
-    known = {cell_name(cell) for cell in CELLS}
-    assert set(assigned) == known, (
-        f"slice table and arm matrix disagree: only-in-table={set(assigned) - known}, "
-        f"only-in-matrix={known - set(assigned)}"
-    )
-    assert len(assigned) == len(set(assigned)), (
-        f"a cell is assigned to two slices and would be measured twice: {assigned}"
-    )
+    def read_tables(pattern):
+        tables, declared = {}, {}
+        for candidate in sorted((repo_root / "kaggle").glob(pattern)):
+            for node in ast.walk(ast.parse(candidate.read_text())):
+                if not isinstance(node, ast.Assign):
+                    continue
+                name = getattr(node.targets[0], "id", "")
+                if name == "SLICES":
+                    tables[candidate.stem] = ast.literal_eval(node.value)
+                elif name == "SLICE":
+                    declared[candidate.stem] = ast.literal_eval(node.value)
+        return tables, declared
 
-    # Each file must DECLARE which slice it is, and declare the right one.
-    # Kaggle renames an uploaded script to script.py, so deriving this from
-    # __file__ made every kernel refuse to start on the measurement host while
-    # working perfectly here. It is a literal now, and a literal can be wrong.
-    declared = {}
-    for candidate in sorted((repo_root / "kaggle").glob("session6?/session6?.py")):
-        for node in ast.walk(ast.parse(candidate.read_text())):
-            if (isinstance(node, ast.Assign)
-                    and getattr(node.targets[0], "id", "") == "SLICE"):
-                declared[candidate.stem] = ast.literal_eval(node.value)
-    assert declared, "no session6 kernel declares a SLICE"
-    for stem, value in declared.items():
-        assert value == stem, (
-            f"kaggle/{stem}/{stem}.py declares SLICE={value!r}. It would measure "
-            f"{slices.get(value)!r} while its name promises {slices.get(stem)!r}, "
-            "and two kernels would silently cover the same cell."
+    for pattern, expected_cells, both_arms in (
+        ("session6?/session6?.py", CELLS, True),
+        ("session7?/session7?.py", GAP_FILL_CELLS, False),
+    ):
+        tables, declared = read_tables(pattern)
+        if not tables:
+            pytest.skip(f"no kernels matching {pattern}")
+
+        first = next(iter(tables.values()))
+        for stem, table in tables.items():
+            assert table == first, (
+                f"kaggle/{stem} carries a different slice table; the kernels in "
+                "one family must be identical copies"
+            )
+            assert declared.get(stem) == stem, (
+                f"kaggle/{stem}/{stem}.py declares SLICE={declared.get(stem)!r}. "
+                "It would measure another slice's cells while its name promises "
+                "its own, and two kernels would silently cover the same work."
+            )
+        assert set(declared) == set(first), (
+            f"slice files {sorted(declared)} do not match the table {sorted(first)}"
         )
-    assert set(declared) == set(slices), (
-        f"slice files {sorted(declared)} do not match the table {sorted(slices)}"
-    )
+
+        # A slice's value is one cell name or a list of them; flatten and check.
+        assigned = []
+        for value in first.values():
+            assigned.extend([value] if isinstance(value, str) else list(value))
+        known = {cell_name(cell) for cell in expected_cells}
+        assert set(assigned) == known, (
+            f"{pattern}: only-in-table={set(assigned) - known}, "
+            f"only-in-matrix={known - set(assigned)}"
+        )
+        assert len(assigned) == len(set(assigned)), (
+            f"{pattern}: a cell is assigned twice and would be measured twice: "
+            f"{assigned}"
+        )
+
+    # Every cell in the full matrix is covered by exactly one family.
+    all_names = {cell_name(cell) for cell in ALL_CELLS}
+    assert all_names == ({cell_name(c) for c in CELLS}
+                         | {cell_name(c) for c in GAP_FILL_CELLS})
+
+
+def test_gap_fill_levels_sit_above_the_baseline_rectangle_cap():
+    """Below the cap both engines are capped by C and the level says nothing.
+
+    `max_resident` is min(rectangle limit, C). At C below the rectangle limit
+    the baseline and the engine are both held at C, the engine's residency
+    advantage is exactly 1.0x, and the cell would buy a loss that is about the
+    cap rather than about paging. The gap-fill levels are chosen to be at or
+    above the cap on at least one rectangle, and C=32 on rect1757 sits exactly
+    ON it -- the crossover, where a tie or a loss is the expected reading.
+    """
+    from bench.arms import GAP_FILL_CELLS
+    from bench.baseline import RECTANGLE_SIZINGS, max_resident
+
+    caps = {rectangle: max_resident(rectangle) for rectangle in RECTANGLE_SIZINGS}
+    assert caps == {3072: 18, 1757: 32}, f"rectangle caps moved: {caps}"
+
+    for cell in GAP_FILL_CELLS:
+        concurrency, rectangle = cell["concurrency"], cell["rectangle"]
+        assert concurrency >= caps[rectangle], (
+            f"gap-fill cell C={concurrency} rect={rectangle} is BELOW the "
+            f"baseline cap of {caps[rectangle]}. Both sides would be capped at "
+            "C, the engine would have no residency advantage, and the level "
+            "would document the cap rather than paging."
+        )
+        assert cell["arms"] == ("B",), (
+            "gap-fill cells run arm B only; arm A mixed is asymmetric (engine "
+            "MATH against a baseline already on EFFICIENT) and may not be timed"
+        )
