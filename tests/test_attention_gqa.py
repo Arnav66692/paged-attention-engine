@@ -16,9 +16,12 @@ what `enable_gqa` allocates instead. `kaggle/session4` did, on the T4, and
 64, kv 2048 -- because MATH expands K/V for its matmul anyway and materialises
 the score matrix on top. It is also 2.76-5.67x slower.
 
-`enable_gqa` is kept regardless, for a reason this file cannot see: it is the
-path the HF baseline takes, measured in `kaggle/session3`. `docs/AMPERE_RECHECK.md`
-items 2 and 6 carry both findings, because both are device-dependent.
+SO `repeat_kv` NOW SHIPS. `enable_gqa` was kept for a while on the grounds that
+it was the path the HF baseline takes -- true only for prompt-UNIFORM batches,
+which is not the realistic stream. Both findings are device-dependent and live
+in `docs/AMPERE_RECHECK.md` items 2 and 6. `enable_gqa` stays selectable: it is
+the reference these equality tests are asserted against and the knob
+`bench/arms.py` turns.
 
 WHAT THIS FILE DOES NOT SHOW, and what it must not be read as showing. These
 tests pass identical inputs to both paths, so equality here says the EXPANSION

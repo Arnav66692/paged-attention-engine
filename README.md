@@ -4,6 +4,16 @@ Block-allocated KV cache, continuous batching, preemption with recompute, and a
 fused batched forward — measured against naive HuggingFace `generate` at an
 identical KV byte ceiling on a Kaggle Tesla T4.
 
+**A note on the name.** This is a paged-attention engine and the paging is real,
+correct, and load-bearing: without a block allocator the engine could not hold
+87 unequal-length sequences in a 3584-block pool at all. But **the measured
+throughput win is attributable to continuous batching, not to paging** — the
+repo's own data rules residency out as the mechanism, in both directions. Paging
+is what makes the residency affordable; refilling a finished sequence's slot
+immediately is what earns the 2×. The reasoning is
+[set out in full below](#so-what-is-the-mechanism-continuous-batching-not-paging),
+including which part of it is measured and which part is elimination.
+
 **The repo is organised so the throughput claim can be audited rather than
 believed.** Every number below came from a run that happened, on hardware named
 in the provenance of the file that holds it. Where something is unmeasured, it
@@ -18,19 +28,25 @@ published.**
 
 | stream | prompt lengths | result |
 |---|---|---|
-| `mixed` | 120 / 224 / 288 distinct lengths at `C=32`/`64`/`87`, all within 40–2048 | **1.89× – 2.06× in Arm B**, winning at all three levels on both sizings — but **0.94× and 0.99× in Arm A**, a loss |
-| `control` | all 512 tokens | **0.66× – 0.79×** — a loss, in both arms, at every sizing |
+| `mixed` | 120 / 224 / 288 distinct lengths at `C=32`/`64`/`87`, all within 40–2048 | **1.89× – 2.06×**, winning at all three levels on both sizings |
+| `control` | all 512 tokens | **0.66× – 0.79×** — a loss, at every sizing |
 
-**Arm A loses `mixed` as well, and that belongs here rather than in a footnote:**
-0.9409× at `mixed-rect3072-C64` and 0.9859× at `mixed-rect1757-C64`. Arm A is the
-engine's *shipped default* (`PAGED_ATTENTION_GQA_PATH=sdpa`), and under it the
-engine sits on `MATH` while HF's ragged batches already hold
-`EFFICIENT_ATTENTION` — the asymmetry described below, priced. Arm A was run on
-`mixed` at `C=64` only; `C=32` and `C=87` are **unmeasured** under the default.
+**The headline is the shipping configuration.** The engine ships
+`PAGED_ATTENTION_GQA_PATH=repeat_kv`, which puts it on `EFFICIENT_ATTENTION`,
+and HuggingFace's ragged batches already pre-expand K/V and land there too. So
+the `mixed` numbers below are this engine as shipped against **unpatched**
+HuggingFace, both sides on the same kernel, with nothing done to either.
 
-So the win requires the engine to be on `repeat_kv`, which is not what it ships
-with today. Every number here is real, and the ones that are not wins are the
-more informative.
+For most of this project the default was `sdpa` instead, chosen to match a
+baseline that an early measurement had found on `MATH`. That match turned out to
+hold only for prompt-uniform batches, and under it the engine sat on the slow
+kernel while HF held the fast one — 0.9409× and 0.9859× on `mixed`, a loss
+bought by a choice nobody made. The default moved; those two numbers are kept in
+[the kernel section](#kernel-bias-477-and-230-at-the-two-cells-that-can-decide-it-sign-not-constant)
+because they are what the handicap cost.
+
+**On `control` the engine holds the faster kernel and still loses.** That is not
+a kernel artifact and it is not being explained away.
 
 ---
 
@@ -107,6 +123,14 @@ different baseline.
 | `control-rect3072-C64` | 0.7702 | 0.7880 |
 | `control-rect1757-C64` | 0.6928 | 0.6598 |
 
+**And this is not the kernel.** On `control` the engine ships
+`repeat_kv`/`EFFICIENT_ATTENTION` while HuggingFace — whose uniform prompts
+collapse the mask to `None` — takes `enable_gqa` and lands on `MATH`. So in the
+shipping configuration **the engine holds the faster kernel here and still
+loses.** Arm B, where the baseline is forced onto `EFFICIENT` too and the
+advantage is removed, is the fairer of the two columns and the loss survives it
+at both sizings.
+
 **The mechanism.** The control stream is 256 requests of exactly 512 prompt and
 512 decode tokens. Every sequence starts together, grows at the same rate, and
 finishes together. That means:
@@ -118,10 +142,10 @@ finishes together. That means:
 - **no rejections** — every request fits both sizings.
 
 Continuous batching and block allocation exist to eliminate exactly those three
-costs. When they are all zero there is nothing to eliminate, and paging is left
-paying its own overheads — per-step block bookkeeping, an explicit attention mask
-instead of the causal shortcut, gather/scatter through a block table, and 32
-preemptions with their recomputes at `C=64`.
+costs. When all three are zero there is nothing to eliminate, and the engine is
+left paying its own overheads for no return — per-step block bookkeeping, an
+explicit attention mask instead of SDPA's causal shortcut, gather/scatter through
+a block table, and 32 preemptions with their recomputes at `C=64`.
 
 **A paged engine should lose here.** A version of this repo that reported a win
 on the control stream would be reporting a bug.
@@ -191,10 +215,40 @@ the step where `peak_blocks_used` hits its measured 3548. Dividing peak blocks b
 64 blocks-per-request gives 55.4 and is **wrong** — sequences hold short block
 runs until they reach full length, so it undercounts the set.) That is still a
 smaller advantage than `mixed-rect3072-C87` enjoys — cap 87 against 18, 4.83× —
-and the control cell loses while the mixed one wins by 2×. What separates a win
-from a loss is **the shape of the stream, not the size of the running set.** Ragged lengths mean a static batch is held by its
-longest member; that waste is what continuous batching removes, and it is present
-at equal residency. Uniform lengths mean there is no such waste at any residency.
+and the control cell loses while the mixed one wins by 2×.
+
+### So what *is* the mechanism: continuous batching, not paging
+
+Residency is eliminated in both directions. What survives is this:
+
+**The baseline runs STATIC batches.** A sequence that finishes early leaves its
+slot idle until every other member of its batch drains. The engine refills that
+slot on the next step. So the quantity that decides the outcome is *how much
+idle slot-time a static batch accumulates*, and that is a property of the spread
+of lengths within a batch:
+
+- **Ragged stream** — 120 to 288 distinct lengths per level, 40 to 2048 tokens.
+  Stragglers are severe, the baseline's batches spend a large fraction of their
+  slot-time idle, and refilling immediately is worth ~2×.
+- **Uniform stream** — every request 512 + 512. Every member of a batch finishes
+  on the same step. There is no idle slot-time to reclaim, so continuous
+  batching has nothing to do, and the engine pays its own scheduling, block
+  translation and preemption overheads for nothing. Hence 0.66–0.79×.
+
+**Paging is what makes high residency affordable; it is not what wins.** The
+block allocator is real, correct, and load-bearing — without it the engine could
+not hold 87 sequences of unequal length in a 3584-block pool at all. But
+residency is not the mechanism, and this repo's own data rules it out.
+
+**This is supported by ELIMINATION, not measured.** Residency is excluded by two
+measurements pointing opposite ways, and continuous batching is the explanation
+left standing. **No static-batching ablation was run on this engine** — that
+would need a contiguous-KV plus fused-batching path, which does not exist here
+(`ContiguousKVCache` is single-sequence, kept as the parity reference). The
+fused/unfused ablation that *does* exist would not settle it either: both modes
+share the paged cache and the scheduler, so it separates the batched forward and
+nothing else. Treat the mechanism as the surviving hypothesis, and treat a
+future static-batching ablation as the thing that would confirm it.
 
 ---
 
