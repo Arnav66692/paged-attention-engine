@@ -437,6 +437,59 @@ def _compare_only(out_dir: Path) -> int:
     return 0
 
 
+def merge_for_plot(out_dir: Path, arm: str, stream: str, rectangle: int) -> dict:
+    """One plot-ready payload from the per-cell files of a single config.
+
+    `bench/plot.py` draws throughput against concurrency from ONE result file
+    holding every level. The sweep writes one file per cell so a dead session
+    loses one cell rather than a matrix, so the levels have to be re-joined
+    here. Only cells from the SAME arm, stream and rectangle are merged: a plot
+    mixing arms would put two different kernels on one line.
+
+    Provenance is taken from the lowest level and checked against the rest --
+    if the cells disagree on anything that decides what was measured, that is
+    an error, not something to average over.
+    """
+    found = []
+    for path in sorted(out_dir.glob(f"arm{arm}-{stream}-rect{rectangle}-C*.json")):
+        payload = json.loads(path.read_text())
+        level = payload["levels"][0]["concurrency"] if payload.get("levels") else 0
+        found.append((level, path, payload))
+    if not found:
+        raise FileNotFoundError(
+            f"no arm{arm} {stream} rect{rectangle} cells in {out_dir}"
+        )
+    found.sort()
+
+    PINNED = ("gqa_path", "baseline_kv_expansion_forced", "dtype", "model_id",
+              "model_sha", "num_gpu_blocks", "block_size", "kv_pool_bytes",
+              "max_num_batched_tokens", "gpu_name", "torch_version")
+    reference = found[0][2]["provenance"]
+    for level, path, payload in found[1:]:
+        for key in PINNED:
+            if payload["provenance"].get(key) != reference.get(key):
+                raise ValueError(
+                    f"{path.name} disagrees with {found[0][1].name} on "
+                    f"{key!r}: {payload['provenance'].get(key)!r} vs "
+                    f"{reference.get(key)!r}. These cells did not measure the "
+                    "same thing and must not share a plot."
+                )
+
+    levels = [lv for _, _, payload in found for lv in payload["levels"]]
+    return {
+        "smoke": False,
+        "throughput_valid": all(lv.get("throughput_valid") for lv in levels),
+        "warmup_passes": found[0][2].get("warmup_passes"),
+        "measured_passes": found[0][2].get("measured_passes"),
+        "escalated_passes": found[0][2].get("escalated_passes"),
+        "spread_limit": found[0][2].get("spread_limit"),
+        "pressure_c": found[0][2].get("pressure_c"),
+        "provenance": reference,
+        "levels": levels,
+        "merged_from": [path.name for _, path, _ in found],
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out-dir", type=Path, default=Path("bench/results/arms"))
@@ -447,6 +500,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument(
+        "--merge-for-plot", nargs=3, metavar=("ARM", "STREAM", "RECTANGLE"),
+        help="join one config's per-cell files into a plot-ready payload",
+    )
+    parser.add_argument(
         "--compare-only", action="store_true",
         help=(
             "run nothing; join the result files already in --out-dir. The "
@@ -455,6 +512,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+
+    if args.merge_for_plot:
+        arm, stream, rectangle = args.merge_for_plot
+        payload = merge_for_plot(args.out_dir, arm, stream, int(rectangle))
+        out = args.out_dir / f"plot-arm{arm}-{stream}-rect{rectangle}.json"
+        out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        print(f"merged {payload['merged_from']} -> {out}")
+        return 0
 
     if args.compare_only:
         return _compare_only(args.out_dir)
