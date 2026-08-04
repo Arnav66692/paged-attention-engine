@@ -212,8 +212,9 @@ def main() -> int:
 
     if unpadded == padded:
         print("\n  Both configurations chose the same backend on this device, so "
-              "there is no cliff here. Expected on sm >= 80, where FLASH can "
-              "honour enable_gqa.")
+              "there is no cliff here. That is the expected outcome wherever "
+              "FLASH can honour enable_gqa -- but this script's author only ran "
+              "it on sm_75, so treat sm >= 80 behaviour as unverified.")
     else:
         print(f"\n  Both timings above ran the SAME uniform batch; the only "
               f"difference is the K/V input shape, forced by the monkeypatch. "

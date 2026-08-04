@@ -18,7 +18,7 @@ published.**
 
 | stream | prompt lengths | result |
 |---|---|---|
-| `mixed` | 224 distinct, 40–2048 tokens | **1.89× – 2.06× in Arm B**, winning at all three levels on both sizings — but **0.94× and 0.99× in Arm A**, a loss |
+| `mixed` | 120 / 224 / 288 distinct lengths at `C=32`/`64`/`87`, all within 40–2048 | **1.89× – 2.06× in Arm B**, winning at all three levels on both sizings — but **0.94× and 0.99× in Arm A**, a loss |
 | `control` | all 512 tokens | **0.66× – 0.79×** — a loss, in both arms, at every sizing |
 
 **Arm A loses `mixed` as well, and that belongs here rather than in a footnote:**
@@ -183,14 +183,16 @@ The engine produced **4,387 more tokens in 235 s less time — ratio 1.965**, on
 of the highest in the matrix. Residency parity is not throughput parity.
 
 **So residency is not the mechanism, and it cannot be in either direction:** the
-engine also *loses* the control stream at `C=64` while holding roughly 55
-sequences against the baseline's 18, roughly a 3× residency advantage. (Derived,
-not directly recorded: peak blocks held was **3548**,
-measured, and a control request is 512 + 512 tokens ÷ `BLOCK_SIZE` 16 = 64
-blocks, so 3548 / 64 ≈ 55.4.) That is a smaller advantage than `mixed-rect3072-C87`
-enjoys — cap 87 against 18, 4.8× — but the control cell loses while the mixed one
-wins by 2×. What separates a win from a loss is **the shape of the stream, not the
-size of the running set.** Ragged lengths mean a static batch is held by its
+engine also *loses* the control stream at `C=64` while holding **64**
+sequences against the baseline's 18 — a **3.56×** residency advantage. (Counted
+from the engine's own `pool_trace`, a complete 608-event record that closes at
+zero: the running set reaches the `max_num_seqs` cap of 64 and stands at 63 at
+the step where `peak_blocks_used` hits its measured 3548. Dividing peak blocks by
+64 blocks-per-request gives 55.4 and is **wrong** — sequences hold short block
+runs until they reach full length, so it undercounts the set.) That is still a
+smaller advantage than `mixed-rect3072-C87` enjoys — cap 87 against 18, 4.83× —
+and the control cell loses while the mixed one wins by 2×. What separates a win
+from a loss is **the shape of the stream, not the size of the running set.** Ragged lengths mean a static batch is held by its
 longest member; that waste is what continuous batching removes, and it is present
 at equal residency. Uniform lengths mean there is no such waste at any residency.
 
@@ -211,10 +213,12 @@ stated, not left to be discovered.** At `mixed-rect1757-C64` the baseline reject
 10 requests and generates **53,172 tokens against the engine's 59,195 — 10.2%
 less work.** The engine serves every request; the baseline cannot.
 
-**The direction matters and it is favourable to the baseline.** Rejected requests
-are the ones over the rectangle — the longest, hence the worst straggler
-generators. The baseline therefore ran the *easier* subset, with its most
-expensive work removed, and was still slower per token. **The reported ratio
+**The direction matters and it is favourable to the baseline.** Rejection is
+`total_len > rectangle`, so the rejected requests are the longest in the stream
+**by construction**, and they carry 6,023 of the 59,195 decode tokens. That they
+are therefore the *worst straggler generators* is an inference, not a
+measurement — but the arithmetic direction does not depend on it: the baseline
+ran a strictly smaller and shorter subset and was still slower per token. **The reported ratio
 understates the engine's advantage on those cells.** An unstated asymmetry in a
 headline is what gets caught; this one is stated, and it points against us.
 
@@ -255,9 +259,13 @@ were broken are the point. These are the ones worth reading first.
 PAGED_ATTENTION_GQA_PATH=repeat_kv python -m bench.run --stream mixed -C 64 --rectangle 3072 --baseline-expand-kv --out bench/results/repro.json
 ```
 
-Requires a CUDA host — `bench/run.py` refuses to write a result file without one,
-because both development machines here showed 76% run-to-run spread. Add
-`--smoke` for a structural run, which is stamped `throughput_valid: false`.
+Requires a CUDA host — `bench/run.py` refuses to write a result file without one.
+The rule exists because this project's development machine (an M4 Mac) showed
+~76% run-to-run spread across its two devices on the Step 5b diagnostic; that
+figure is recorded in `bench/run.py`'s docstring as prose and **no result file
+in this repo holds it**, so treat it as the reason for the rule rather than as a
+measurement you can check here. Add `--smoke` for a structural run, which is
+stamped `throughput_valid: false`.
 
 Plots: `python -m bench.arms --merge-for-plot B mixed 3072 --out-dir bench/results/arms`
 then `python -m bench.plot bench/results/arms/plot-armB-mixed-rect3072.json`.

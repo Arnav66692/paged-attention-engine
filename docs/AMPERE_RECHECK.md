@@ -117,7 +117,7 @@ are tight enough (≤0.2%) that a 2–5% shift is comfortably resolvable.
 
 So the kernel switch is **not** a uniform change in a shared per-token cost `k`.
 The two sides issue different shapes — the engine a padded rectangle over a
-~55-sequence running set, the baseline a static batch of 18 or 32 — and
+64-sequence running set, the baseline a static batch of 18 or 32 — and
 `EFFICIENT_ATTENTION` rewards those shapes by different factors. At resident 32
 the baseline benefits more than the engine does; at 18 it benefits less.
 

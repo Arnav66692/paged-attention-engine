@@ -58,11 +58,9 @@ is the regime the gating change is meant to protect and the one with no data.
 > | 32 resident | 202.0 tok/s | 370.9 tok/s | **1.84×** |
 >
 > Identical work in both columns — same prompts, same token counts, greedy,
-> `min_new_tokens == max_new_tokens`. At the level of a single attention call the
-> gap is 2.76×–5.67× depending on shape, with `enable_gqa`/MATH also allocating
-> 3.3×–8.3× more transient memory (2567 MiB vs 768 MiB at batch 64, kv 2048) —
-> MATH expands K/V for its matmul anyway and materialises the score matrix on
-> top, so the allocation-free path is neither.
+> `min_new_tokens == max_new_tokens`, and the batch is uniform so
+> `attention_mask` is `None` on both sides. The only difference is the return
+> value of `use_gqa_in_sdpa`.
 >
 > **The part I think is worth calling out separately.** On CUDA with torch >= 2.5,
 > `use_gqa_in_sdpa()` returns `True` exactly when `attention_mask is None`, which
@@ -78,10 +76,13 @@ is the regime the gating change is meant to protect and the one with no data.
 > no warning, no fallback message, and the config that looks obviously optimal
 > (uniform batch, no padding waste) is the one that loses ~1.6–1.8× end to end.
 >
-> Standalone repro attached: two `generate()` calls doing identical work, one
-> uniform and one with pre-expansion forced, printing the selected backend and
-> the timing delta. It prints "no cliff here" on sm ≥ 80, so it should be a
-> no-op on your 3090/4090.
+> Standalone repro attached: two `generate()` calls doing identical work on the
+> same uniform batch, one as shipped and one with pre-expansion forced, printing
+> the selected backend for each and the timing delta. **I have not run it on
+> sm ≥ 80** — no Ampere-or-later device was available for any of this — so what
+> it reports on your 3090/4090 is unknown to me. If FLASH can honour
+> `enable_gqa` there, both columns should name the same backend and the delta
+> should collapse; that is a prediction, not something I measured.
 >
 > Not attached to any opinion on the fix — the `SDPAParams` / fullgraph blocker
 > in this thread is real and I have nothing to add on it. Flagging only that on
@@ -96,9 +97,15 @@ is the regime the gating change is meant to protect and the one with no data.
 |---|---|
 | backends selected, both K/V forms | `kaggle/session5` gate 2, `kaggle/session3` |
 | FLASH/CUDNN reject every shape on sm_75 | `docs/AMPERE_RECHECK.md` item 2 |
-| 1.62× / 1.84× end to end | `bench/results/arms/arm{A,B}-control-rect{3072,1757}-C64.json`, baseline levels |
-| 2.76×–5.67× per attention call; 3.3×–8.3× transient | `kaggle/session4/session4_report.json` |
+| 1.62× / 1.84× end to end, uniform mask-free batch | `bench/results/arms/arm{A,B}-control-rect{3072,1757}-C64.json`, baseline levels |
 | `use_gqa_in_sdpa` returns True iff mask is None | transformers 5.12.1 and `main`, verified 2026-08 |
+
+**Deliberately NOT included:** the per-attention-call gap (2.76×–5.67×) and the
+transient-memory ratio (3.3×–8.3×) from `kaggle/session4`. Those were measured
+with an explicit boolean mask on **both** paths, which is this engine's shape,
+not HuggingFace's — HF's `enable_gqa` path only ever runs with `attn_mask=None`.
+They do not characterise HF's two shipped paths and would be wrong to offer
+upstream as if they did.
 
 Every figure is from a run that happened. The 1.62×/1.84× pair are **baseline
 levels only** — the paged engine is not part of this comparison and should not
