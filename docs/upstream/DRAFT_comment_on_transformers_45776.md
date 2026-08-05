@@ -76,13 +76,43 @@ is the regime the gating change is meant to protect and the one with no data.
 > no warning, no fallback message, and the config that looks obviously optimal
 > (uniform batch, no padding waste) is the one that loses ~1.6–1.8× end to end.
 >
-> Standalone repro attached: two `generate()` calls doing identical work on the
-> same uniform batch, one as shipped and one with pre-expansion forced, printing
-> the selected backend for each and the timing delta. **I have not run it on
-> sm ≥ 80** — no Ampere-or-later device was available for any of this — so what
-> it reports on your 3090/4090 is unknown to me. If FLASH can honour
-> `enable_gqa` there, both columns should name the same backend and the delta
-> should collapse; that is a prediction, not something I measured.
+> **torch says why, in its own words.** Running the pinned-backend probe emits,
+> verbatim:
+>
+> ```
+> Flash attention only supports gpu architectures in the range [sm80, sm121].
+>   Attempting to run on a sm 7.5 gpu.
+> For dense input, both fused kernels require query, key and value to have the
+>   same num_heads. Query.sizes(): [8, 12, 512, 128],
+>   Key sizes(): [8, 2, 512, 128], Value sizes(): [8, 2, 512, 128] instead.
+> ```
+>
+> The second line is the whole thing: the unexpanded K/V shape is *why* both
+> fused kernels decline, and `enable_gqa=True` is what produces that shape.
+>
+> **Standalone repro attached.** Two `generate()` calls doing identical work on
+> the same uniform batch, one as shipped and one with pre-expansion forced,
+> printing the selected backend for each and the timing delta. Its own default
+> shape is smaller than the table above — batch 8, 512-token prompts, 64 new
+> tokens — and on the T4 it reports:
+>
+> ```
+> uniform batch, as HF ships it    enable_gqa=True   -> ['MATH']
+> same batch, K/V pre-expanded     enable_gqa=False  -> ['EFFICIENT_ATTENTION']
+> enable_gqa   (as shipped) :   3.394s  [3.391, 3.415]
+> pre-expanded K/V          :   2.520s  [2.497, 2.522]
+> pre-expanding is 1.35x faster on IDENTICAL work
+> ```
+>
+> **1.35×, not the 1.6–1.8× above** — the gap narrows at 64 new tokens because
+> prefill is a larger share of the run, and widens with decode length and batch.
+> Both are real; the repro is deliberately small so it finishes in seconds.
+> Pass `--batch 32 --new-tokens 512` to approach the table.
+>
+> **I have not run any of this on sm ≥ 80** — no Ampere-or-later device was
+> available — so what the script reports on your 3090/4090 is unknown to me. If
+> FLASH can honour `enable_gqa` there, both columns should name the same backend
+> and the delta should collapse; that is a prediction, not a measurement.
 >
 > Not attached to any opinion on the fix — the `SDPAParams` / fullgraph blocker
 > in this thread is real and I have nothing to add on it. Flagging only that on
@@ -99,6 +129,8 @@ is the regime the gating change is meant to protect and the one with no data.
 | FLASH/CUDNN reject every shape on sm_75 | `docs/AMPERE_RECHECK.md` item 2 |
 | 1.62× / 1.84× end to end, uniform mask-free batch | `bench/results/arms/arm{A,B}-control-rect{3072,1757}-C64.json`, baseline levels |
 | `use_gqa_in_sdpa` returns True iff mask is None | transformers 5.12.1 and `main`, verified 2026-08 |
+| repro output, 1.35× at batch 8 / 64 new tokens | `kaggle/session9/session9_report.json` — script run standalone from a bare directory, rc=0 |
+| torch's own warning text | same run, verbatim from stderr |
 
 **Deliberately NOT included:** the per-attention-call gap (2.76×–5.67×) and the
 transient-memory ratio (3.3×–8.3×) from `kaggle/session4`. Those were measured
