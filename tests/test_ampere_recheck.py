@@ -145,10 +145,34 @@ def test_the_list_does_not_assert_a_direction_it_has_not_measured():
             )
 
 
-def test_claude_md_points_at_the_list():
-    """A doc nothing links to is a doc nobody opens."""
+def test_the_readme_points_at_the_list():
+    """A doc nothing links to is a doc nobody opens.
+
+    The README is the durable guarantee: it is always tracked, so this holds in
+    every clone. CLAUDE.md is checked separately and only where it exists.
+    """
+    readme = REPO_ROOT / "README.md"
+    assert readme.exists(), "README.md is missing from the repository root"
+    assert "AMPERE_RECHECK" in readme.read_text(), (
+        "README.md does not reference docs/AMPERE_RECHECK.md, so someone "
+        "cloning this and running on an Ampere card has no reason to find it"
+    )
+
+
+def test_claude_md_points_at_the_list_where_claude_md_exists():
+    """Skipped rather than failed when the file is not in the tree.
+
+    CLAUDE.md is excluded by a GLOBAL gitignore on the machine this was built
+    on, so it is present in the working copy and absent from every clone. A
+    hard assertion made `pytest` red for anyone who cloned the repo -- a
+    failure about a file the repository does not contain and never claimed to.
+    The invariant is real where the file is real, so it is asserted there and
+    skipped otherwise; `test_the_readme_points_at_the_list` is the version that
+    always runs.
+    """
     claude_md = REPO_ROOT / "CLAUDE.md"
-    assert claude_md.exists()
+    if not claude_md.exists():
+        pytest.skip("CLAUDE.md is not in this tree (gitignored); README covers it")
     assert "AMPERE_RECHECK" in claude_md.read_text(), (
         "CLAUDE.md does not reference docs/AMPERE_RECHECK.md, so a new session "
         "has no reason to find it"
