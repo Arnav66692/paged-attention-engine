@@ -23,3 +23,24 @@ kaggle.json
 # The extraction cache is machine-local and rebuilt on demand.
 graphify-out/cache/
 graphify-out/.graphify_*
+
+# Credential shapes. None has ever been tracked -- history was scanned before
+# the first push and contains no PEM block, no {"username","key"} pair and no
+# 32-hex literal, which is a Kaggle API key's exact shape. These are here so
+# that stays true by construction rather than by having been checked once.
+.env
+.env.*
+*.pem
+*.key
+*.p12
+id_rsa*
+.netrc
+.htpasswd
+credentials.json
+service-account*.json
+
+# Stale snapshot of the source tree, produced by a Kaggle output download and
+# committed by accident in c666068. 27 files, 400 KB, and already diverged from
+# the real tree -- an old engine/attention.py sitting next to the current one is
+# worse than no copy at all.
+/repo/

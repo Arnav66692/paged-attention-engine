@@ -321,8 +321,19 @@ in this repo holds it**, so treat it as the reason for the rule rather than as a
 measurement you can check here. Add `--smoke` for a structural run, which is
 stamped `throughput_valid: false`.
 
-Plots: `python -m bench.arms --merge-for-plot B mixed 3072 --out-dir bench/results/arms`
-then `python -m bench.plot bench/results/arms/plot-armB-mixed-rect3072.json`.
+**Plots, from the published results — no GPU needed.** `bench/results/` is
+gitignored (it is an output directory), so the measured result files ship under
+`kaggle/session6*/` and `kaggle/session7*/` instead. Gather them first:
+
+```bash
+mkdir -p bench/results/arms && cp kaggle/session[67]*/arm[AB]-*.json bench/results/arms/
+python -m bench.arms --compare-only --out-dir bench/results/arms
+python -m bench.arms --merge-for-plot B mixed 3072 --out-dir bench/results/arms
+python -m bench.plot bench/results/arms/plot-armB-mixed-rect3072.json --out-dir bench/plots
+```
+
+That reproduces the comparison table and both plots from the committed
+measurements, on any machine.
 
 Tests: `pytest` and `pytest -m slow` — both halves run before every commit.
 
