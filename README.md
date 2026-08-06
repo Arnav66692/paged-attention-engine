@@ -97,7 +97,9 @@ For dense input, both fused kernels require query, key and value to have the
 Standalone reproduction, torch + transformers only:
 [`docs/upstream/repro_enable_gqa_padding_cliff.py`](docs/upstream/repro_enable_gqa_padding_cliff.py).
 Its defaults are smaller than the table — batch 8, 64 new tokens — and it reports
-**1.35×**; the gap widens with decode length and batch. Reported upstream on
+**1.35×**; the gap widens with decode length and batch. Written up on its own at
+[`docs/hf-padding-kernel-cliff.md`](docs/hf-padding-kernel-cliff.md) and reported
+upstream on
 [huggingface/transformers#45776](https://github.com/huggingface/transformers/issues/45776),
 which already describes the mechanism but has no sm_75 data.
 
