@@ -44,3 +44,10 @@ service-account*.json
 # the real tree -- an old engine/attention.py sitting next to the current one is
 # worse than no copy at all.
 /repo/
+
+# Kaggle run debris that reached the repo root. c.txt is the one-line pip
+# constraint file each kernel writes; session4_report.json was a byte-identical
+# duplicate of kaggle/session4/session4_report.json. Both were the first two
+# things visible in a bare `ls` of the repo.
+/c.txt
+/session*_report.json
