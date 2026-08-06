@@ -29,9 +29,10 @@ The repo reaches the host as a private Kaggle Dataset attached to the kernel,
 not by cloning inside the notebook. Two reasons, and the second is the one that
 decided it:
 
-- This repo has **no git remote**. A clone would need a GitHub repo created
-  first, which is one more thing needing a human — exactly what the API route
-  exists to avoid.
+- The measurement host takes the repo through a Kaggle **dataset**, not git.
+  `push.py` stages the tracked source into `kaggle/_build/dataset` and
+  versions it; the kernel copies it out at startup. A git remote is not
+  part of that path.
 - A dataset **still works if internet stays blocked**. The repo arrives through
   the read-only input mount rather than over the network, so if phone
   verification is pending, the failure is confined to the pip install and the

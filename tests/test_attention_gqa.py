@@ -321,3 +321,51 @@ def test_no_gqa_test_was_quietly_switched_to_allclose():
         f"only {len(equals)} torch.equal calls remain; the bit-equality claims "
         "are the point of this file"
     )
+
+
+def test_the_prose_in_attention_py_does_not_contradict_the_shipped_default():
+    """The comments described the OTHER configuration as current, in four places.
+
+    Found by handing a fresh clone to a reader with no context. `repeat_kv`'s own
+    docstring said "NO LONGER ON THE ATTENTION PATH" while being the shipped
+    path; `_sdpa` said "WHY `sdpa` IS THE DEFAULT" while it was not; and the
+    kernel bias was described as "UNMEASURED AND OF UNKNOWN SIGN" after both
+    arms had measured it at +2.30% and -4.77%.
+
+    That is the worst possible file for stale prose -- the highest comment
+    density in the repo, wrapping the one switch everything else depends on --
+    and nothing caught it, because pinning the VALUE of GQA_PATH says nothing
+    about the paragraph above it claiming the opposite.
+    """
+    from engine import attention
+
+    source = Path(attention.__file__).read_text()
+    shipped = attention.GQA_PATH
+
+    # Phrases that are only true of the configuration that is NOT shipped.
+    contradictions = {
+        "repeat_kv": [
+            "NO LONGER ON THE ATTENTION PATH",
+            "WHY `sdpa` IS THE DEFAULT",
+            "GQA IS SDPA'S JOB, NOT OURS",
+        ],
+        "sdpa": [
+            "`repeat_kv` SHIPS",
+            "THIS IS THE SHIPPED PATH",
+        ],
+    }
+    for phrase in contradictions.get(shipped, []):
+        assert phrase not in source, (
+            f"engine/attention.py still says {phrase!r}, which describes the "
+            f"path that is NOT shipped. GQA_PATH is {shipped!r}. A reader trusts "
+            "the prose here more than anywhere else in the repo; it is the file "
+            "that argues for its own trustworthiness."
+        )
+
+    # A settled measurement must not still be described as open.
+    for phrase in ("UNMEASURED AND OF UNKNOWN SIGN",
+                   "is UNMEASURED and OF UNKNOWN SIGN"):
+        assert phrase not in source, (
+            f"engine/attention.py still calls the kernel bias {phrase!r}. Both "
+            "arms measured it: +2.30% at rect3072 and -4.77% at rect1757."
+        )

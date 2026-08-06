@@ -46,10 +46,10 @@ from engine.cache import (
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """Expand KV heads to query heads for GQA, MATERIALISING the copy.
 
-    NO LONGER ON THE ATTENTION PATH. `_sdpa` hands unexpanded K/V to SDPA with
-    `enable_gqa=True`, which broadcasts internally and allocates nothing. This is
-    kept as the reference the switch was checked against, and because
-    `kaggle/session1` uses it to measure what the expansion costs.
+    THIS IS THE SHIPPED PATH. `GQA_PATH` defaults to "repeat_kv", so `_sdpa`
+    materialises the expansion before every attention call. On sm_75 that is
+    what reaches EFFICIENT_ATTENTION; the alternative, `enable_gqa=True`, falls
+    back to MATH and is both slower and heavier.
 
     THE COPY IS EXACT. It moves fp16 into fp16 and is bit-identical to
     `repeat_interleave`. It cost memory and nothing else -- in particular it did
@@ -151,11 +151,11 @@ def _sdpa(
     fused batch supplies an explicit mask because padding makes the shortcut
     wrong.
 
-    GQA IS SDPA'S JOB, NOT OURS. K and V go in with their own head count and
-    `enable_gqa=True` broadcasts them across the query heads inside the kernel.
-    The alternative -- `repeat_kv` above -- materialises the expansion. Given
-    identical inputs the two produce BIT-EXACT results: verified equal, not
-    merely close, masked and causal, on cpu and mps. `tests/test_attention_gqa.py`
+    TWO GQA PATHS, AND `repeat_kv` SHIPS. Pre-expanded K/V reaches
+    EFFICIENT_ATTENTION; unexpanded K/V with `enable_gqa=True` reaches MATH on
+    sm_75 and is slower and heavier. Given identical inputs the two are
+    BIT-EXACT on cpu and mps -- and NOT on CUDA, where they dispatch to
+    different kernels; those cases are xfail(strict=True). `tests/test_attention_gqa.py`
     keeps checking that.
 
     THE ORIGINAL REASON FOR THIS SWITCH WAS MEMORY, AND THAT REASON IS WRONG.
@@ -189,8 +189,9 @@ def _sdpa(
     `bench/run.py` now records which backend runs. See
     `kaggle/session2` for the measurement that established this.
 
-    WHY `sdpa` IS THE DEFAULT, GIVEN THAT IT IS SLOWER AND HEAVIER -- AND WHY
-    THAT REASON ONLY COVERS ONE OF THE TWO STREAMS. `kaggle/session3`
+    WHY `sdpa` WAS THE DEFAULT FOR MOST OF THIS PROJECT, AND WHY IT NO LONGER
+    IS. It was chosen for benchmark symmetry, and that reason covered only one
+    of the two streams. `kaggle/session3`
     intercepted the baseline's real SDPA calls during `model.generate`: 112 of
     them, all passing unexpanded K/V with `enable_gqa=True`, all selecting MATH.
     Read as "the baseline matches the engine". IT DOES NOT GENERALISE.
@@ -211,9 +212,9 @@ def _sdpa(
     confound pointing the other way. Neither path is symmetric on both streams,
     which is the whole reason `bench/arms.py` exists.
 
-    WHETHER THE SHARED KERNEL BIASES THE RATIO IS UNMEASURED AND OF UNKNOWN
-    SIGN. Symmetric is not the same as unbiased, but the direction cannot be
-    reasoned out. Raising the per-token cost `k` for both sides drives
+    THE SHARED KERNEL BIASES THE RATIO BY A MEASURED +-5%, AND THE SIGN IS NOT
+    CONSTANT: +2.30% at rectangle 3072 and -4.77% at 1757. Symmetric is not the
+    same as unbiased, and the direction could not be reasoned out -- Raising the per-token cost `k` for both sides drives
     `(B_e/B_b)(W + B_b·k)/(W + B_e·k)` toward 1, which makes MATH a FLOOR; while
     static-batch stragglers make the baseline recompute finished sequences until
     its batch drains, which is real wasted per-token work and makes MATH a

@@ -14,10 +14,35 @@ immediately is what earns the 2×. The reasoning is
 [set out in full below](#so-what-is-the-mechanism-continuous-batching-not-paging),
 including which part of it is measured and which part is elimination.
 
-**The repo is organised so the throughput claim can be audited rather than
-believed.** Every number below came from a run that happened, on hardware named
-in the provenance of the file that holds it. Where something is unmeasured, it
-says unmeasured. Where the engine loses, it says so, in the same size type.
+```bash
+pip install -r requirements.txt        # or requirements.lock.txt for the exact pins
+pytest                                  # ~12 minutes; -m slow is a second ~3
+```
+
+```python
+from transformers import AutoModelForCausalLM
+from engine.model import Qwen2Engine
+from engine.cache import BlockAllocator
+from engine.scheduler import ExecutionMode, Qwen2Executor, Request, Scheduler
+
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct").eval().cuda()
+engine = Qwen2Engine.from_hf_model(model)
+
+allocator = BlockAllocator(num_blocks=3584, block_size=16)
+cache = engine.new_paged_cache(allocator.num_blocks, allocator.block_size)
+scheduler = Scheduler(Qwen2Executor(engine, cache, allocator), allocator,
+                      mode=ExecutionMode.FUSED, max_num_seqs=64,
+                      max_num_batched_tokens=8192)
+
+scheduler.add_request(Request("r0", prompt_token_ids=(1, 2, 3), max_new_tokens=32))
+outputs = scheduler.run_to_completion()      # {request_id: (token, ...)}
+```
+
+**What it is measured against.** Naive static-batch HuggingFace `generate` — a
+deliberately weak opponent. It is not vLLM, TGI, or any production engine, and
+nothing here was ever benchmarked against one. Beating static batching on a
+stream with 224 distinct prompt lengths is close to the expected result; the
+interesting part is the methodology and the kernel finding, not the ratio.
 
 ---
 
@@ -147,8 +172,7 @@ left paying its own overheads for no return — per-step block bookkeeping, an
 explicit attention mask instead of SDPA's causal shortcut, gather/scatter through
 a block table, and 32 preemptions with their recomputes at `C=64`.
 
-**A paged engine should lose here.** A version of this repo that reported a win
-on the control stream would be reporting a bug.
+A paged engine should lose here.
 
 ---
 
@@ -267,7 +291,7 @@ stated, not left to be discovered.** At `mixed-rect1757-C64` the baseline reject
 10 requests and generates **53,172 tokens against the engine's 59,195 — 10.2%
 less work.** The engine serves every request; the baseline cannot.
 
-**The direction matters and it is favourable to the baseline.** Rejection is
+**The direction favours the baseline.** Rejection is
 `total_len > rectangle`, so the rejected requests are the longest in the stream
 **by construction**, and they carry 6,023 of the 59,195 decode tokens. That they
 are therefore the *worst straggler generators* is an inference, not a
