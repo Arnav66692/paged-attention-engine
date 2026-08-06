@@ -345,7 +345,8 @@ Tests: `pytest` and `pytest -m slow` — both halves run before every commit.
 here was taken on a Kaggle **T4, sm_75**, and six results are properties of that
 device rather than of this code — TF32 is inert below sm_80 so the fp32 pin is
 untested against what it defends; FLASH and CUDNN reject every shape this engine
-issues on sm_75, so backend selection will move on Ampere; and the kernel-bias
+issues on sm_75, so backend selection is expected to move on Ampere — **expected,
+not measured; no sm_80-or-later device was ever run here**; and the kernel-bias
 result above is a fact about which backend `enable_gqa` selects, which changes
 with the device. `tests/test_ampere_recheck.py` fails if any item is dropped.
 
