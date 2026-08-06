@@ -47,7 +47,7 @@ PLACEHOLDER = "KAGGLE_USERNAME"
 # -- including "the list exists" -- for the whole time the full suite had never
 # been run there. A test that reads a file needs that file shipped.
 REPO_INCLUDE = ("engine", "bench", "tests", "docs", "conftest.py", "pytest.ini",
-                "requirements.txt")
+                "requirements-dev.txt", "requirements-measurement.txt")
 # Copied if present, skipped if not. CLAUDE.md is gitignored, so it exists on a
 # clone but not in a worktree; test_claude_md_points_at_the_list reads it and
 # would otherwise fail on the measurement host for a reason that is not a bug.

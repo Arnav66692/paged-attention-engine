@@ -1,0 +1,24 @@
+# MEASUREMENT environment: the Kaggle Tesla T4 that produced every number.
+#
+# Read straight out of `provenance` in the twelve result files under
+# kaggle/session6*/ and kaggle/session7*/. All twelve agree exactly:
+#
+#   torch            2.10.0+cu128
+#   python           3.12.13
+#   platform         Linux-6.12.90+-x86_64-with-glibc2.35
+#   gpu              Tesla T4 (sm_75)
+#   driver           580.159.04
+#   dtype            torch.float16
+#   model            Qwen/Qwen2.5-1.5B-Instruct
+#   model_sha        989aa7980e4cf806f80c7fef2b1adb7bc71aa306
+#   PYTORCH_ALLOC_CONF  expandable_segments:True
+#
+# torch is NOT pinned here. Kaggle supplies it with the image and the CUDA build
+# is part of that image; the kernels install transformers against whatever torch
+# is present, via a constraints file, precisely so the environment cannot drift
+# out from under the pin. `kaggle/session*/`'s scripts do this in two lines.
+#
+# To reproduce a number you need a CUDA host, not this file. `bench/run.py`
+# refuses to write results without one.
+
+transformers==5.12.1

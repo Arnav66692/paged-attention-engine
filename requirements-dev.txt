@@ -1,0 +1,24 @@
+# DEVELOPMENT environment: an M4 Mac, CPU and MPS only.
+#
+# This is what `pytest` runs under locally. IT PRODUCED NO NUMBER IN THIS REPO.
+# Local machines cannot time anything here -- `bench/run.py` refuses to write a
+# result file without CUDA -- so this environment exists to run the correctness
+# suite and nothing else.
+#
+# Every throughput, latency and memory figure came from
+# `requirements-measurement.txt` instead. The two differ, most importantly in
+# torch (2.12.1 here, 2.10.0+cu128 there), and that difference is stated rather
+# than smoothed over: pinning one file and citing numbers from the other is the
+# kind of provenance gap this repo exists to avoid.
+#
+#   python 3.14.6, macOS-15.5-arm64
+#
+# Exact transitive pins: requirements-dev.lock.txt
+
+torch==2.12.1
+transformers==5.12.1
+tokenizers==0.22.2
+accelerate==1.14.0
+numpy==2.5.0
+matplotlib==3.11.1
+pytest==9.1.1
