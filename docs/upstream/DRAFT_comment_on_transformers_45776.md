@@ -102,15 +102,18 @@ is the regime the gating change is meant to protect and the one with no data.
 > ```
 > uniform batch, as HF ships it    enable_gqa=True   -> ['MATH']
 > same batch, K/V pre-expanded     enable_gqa=False  -> ['EFFICIENT_ATTENTION']
-> enable_gqa   (as shipped) :   3.394s  [3.391, 3.415]
-> pre-expanded K/V          :   2.520s  [2.497, 2.522]
-> pre-expanding is 1.35x faster on IDENTICAL work
+> enable_gqa   (as shipped) :   3.374s
+> pre-expanded K/V          :   2.683s
+> pre-expanding is 1.26x faster on IDENTICAL work
 > ```
 >
-> **1.35x, not the 1.6 to 1.8x above.** The gap narrows at 64 new tokens because
-> prefill is a larger share of the run, and widens with decode length and batch.
-> Both are real; the repro is deliberately small so it finishes in seconds.
-> Pass `--batch 32 --new-tokens 512` to approach the table.
+> The backend selection is stable. The ratio is not: two runs of this script on
+> the same T4 gave 1.35x and 1.26x, so expect roughly 1.3x rather than a precise
+> figure, and treat anything in that neighbourhood as agreement. It is smaller
+> than the 1.6 to 1.8x above because at 64 new tokens prefill is a larger share
+> of the run; the gap widens with decode length and batch. The repro is
+> deliberately small so it finishes in seconds. Pass
+> `--batch 32 --new-tokens 512` to move it toward the table.
 >
 > **I have not run any of this on sm >= 80.** No Ampere-or-later device was
 > available, so what the script reports on sm_86 or sm_89 is unknown to me. If
@@ -134,7 +137,7 @@ is the regime the gating change is meant to protect and the one with no data.
 | FLASH/CUDNN reject every shape on sm_75 | `docs/AMPERE_RECHECK.md` item 2 |
 | 1.62x / 1.84x end to end, uniform mask-free batch | `bench/results/arms/arm{A,B}-control-rect{3072,1757}-C64.json`, baseline levels |
 | `use_gqa_in_sdpa` returns True iff mask is None | transformers 5.12.1 and `main`, verified 2026-08 |
-| repro output, 1.35× at batch 8 / 64 new tokens | `kaggle/session9/session9_report.json` — script run standalone from a bare directory, rc=0 |
+| repro output, 1.35x and 1.26x on two runs | `kaggle/session9/session9_report.json` and `session9_report_run2.json`, both standalone from a bare directory, rc=0 |
 | torch's own warning text | same run, verbatim from stderr |
 
 **Deliberately NOT included:** the per-attention-call gap (2.76 to 5.67x) and the

@@ -76,8 +76,10 @@ print("pre-expanded ->", which(q, rep(k), rep(v)))          # ['EFFICIENT']
 
 A fuller version that times two real `generate()` calls is
 [here](upstream/repro_enable_gqa_padding_cliff.py). Its defaults are smaller,
-batch 8 and 64 new tokens, and it reports **1.35x**. The gap widens with decode
-length and batch, which is why the table above is larger.
+batch 8 and 64 new tokens, and it reports roughly **1.3x**: two runs on the same
+T4 gave 1.35x and 1.26x. The backend selection is stable, the ratio moves a
+little run to run, and the gap widens with decode length and batch, which is why
+the table above is larger.
 
 I have not run any of this on sm >= 80. If FLASH can honour `enable_gqa` there,
 the two paths should land on the same backend and the gap should close, but that
