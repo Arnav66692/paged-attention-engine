@@ -14,9 +14,9 @@
 #45776 already identifies the mechanism and lists `sm < 80` among the FA
 constraints that cause the silent MATH fallback. What it does not have:
 
-1. **any sm_75 data** — its benchmarks are RTX 3090 (sm_86) and RTX 4090
-   (sm_89), both of which *have* FLASH, so `enable_gqa` is honoured there and the
-   fallback never fires;
+1. **any sm_75 data** — its benchmarks are on sm_86 and sm_89 hardware, both of
+   which *have* FLASH, so `enable_gqa` is honoured there and the fallback never
+   fires;
 2. **an end-to-end figure larger than ~2.5%** — that is its own number, from a
    135M-parameter model;
 3. **the inverted user-facing consequence** — on sm < 80 the
@@ -110,7 +110,7 @@ is the regime the gating change is meant to protect and the one with no data.
 > Pass `--batch 32 --new-tokens 512` to approach the table.
 >
 > **I have not run any of this on sm ≥ 80** — no Ampere-or-later device was
-> available — so what the script reports on your 3090/4090 is unknown to me. If
+> available — so what the script reports on sm_86 or sm_89 is unknown to me. If
 > FLASH can honour `enable_gqa` there, both columns should name the same backend
 > and the delta should collapse; that is a prediction, not a measurement.
 >
