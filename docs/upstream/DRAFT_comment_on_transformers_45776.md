@@ -17,8 +17,11 @@ constraints that cause the silent MATH fallback. What it does not have:
 1. **any sm_75 data** — its benchmarks are on sm_86 and sm_89 hardware, both of
    which *have* FLASH, so `enable_gqa` is honoured there and the fallback never
    fires;
-2. **an end-to-end figure larger than ~2.5%** — that is its own number, from a
-   135M-parameter model;
+2. **any measurement of how large the fallback is.** Its `+2.6%` (22.943 ms ->
+   23.535 ms, SmolLM2-135M, sm_89) is the OVERHEAD OF THE ELIGIBILITY PROBE on
+   hardware where FLASH exists and the fallback never fires — that is the PR
+   being careful about the cost of its own fix, and it is not a measurement of
+   the problem. Nothing in the thread sizes the fallback itself;
 3. **the inverted user-facing consequence** — on sm < 80 the
    `attention_mask is None` path selects the *slower* kernel, so padding your
    inputs makes HuggingFace faster. Nothing in the thread says this.
@@ -42,7 +45,7 @@ is the regime the gating change is meant to protect and the one with no data.
 > | K/V form | `enable_gqa` | backend selected on sm_75 |
 > |---|---|---|
 > | unexpanded (what `use_gqa_in_sdpa() == True` produces) | `True` | `MATH` |
-> | pre-expanded via `repeat_kv` | — | `EFFICIENT_ATTENTION` |
+> | pre-expanded via `repeat_kv` | not set | `EFFICIENT_ATTENTION` |
 >
 > `FLASH_ATTENTION` and `CUDNN_ATTENTION` reject every shape tested on this
 > device.
@@ -54,10 +57,10 @@ is the regime the gating change is meant to protect and the one with no data.
 >
 > | batch shape | as shipped | K/V pre-expanded | speedup |
 > |---|---|---|---|
-> | 18 resident | 177.8 tok/s | 288.9 tok/s | **1.62×** |
-> | 32 resident | 202.0 tok/s | 370.9 tok/s | **1.84×** |
+> | 18 resident | 177.8 tok/s | 288.9 tok/s | **1.62x** |
+> | 32 resident | 202.0 tok/s | 370.9 tok/s | **1.84x** |
 >
-> Identical work in both columns — same prompts, same token counts, greedy,
+> Identical work in both columns. Same prompts, same token counts, greedy,
 > `min_new_tokens == max_new_tokens`, and the batch is uniform so
 > `attention_mask` is `None` on both sides. The only difference is the return
 > value of `use_gqa_in_sdpa`.
@@ -72,9 +75,9 @@ is the regime the gating change is meant to protect and the one with no data.
 > - adding one shorter prompt forces a mask, HF pre-expands, and the same batch
 >   takes the **fast** one.
 >
-> **Padding your inputs makes it faster.** That is invisible from the outside —
-> no warning, no fallback message, and the config that looks obviously optimal
-> (uniform batch, no padding waste) is the one that loses ~1.6–1.8× end to end.
+> **Padding your inputs makes it faster.** That is invisible from the outside.
+> No warning, no fallback message, and the configuration that looks optimal,
+> a uniform batch with no padding waste, is the one that loses 1.6 to 1.8x.
 >
 > **torch says why, in its own words.** Running the pinned-backend probe emits,
 > verbatim:
@@ -93,8 +96,8 @@ is the regime the gating change is meant to protect and the one with no data.
 > **Standalone repro attached.** Two `generate()` calls doing identical work on
 > the same uniform batch, one as shipped and one with pre-expansion forced,
 > printing the selected backend for each and the timing delta. Its own default
-> shape is smaller than the table above — batch 8, 512-token prompts, 64 new
-> tokens — and on the T4 it reports:
+> shape is smaller than the table above, batch 8 with 512-token prompts and 64
+> new tokens, and on the T4 it reports:
 >
 > ```
 > uniform batch, as HF ships it    enable_gqa=True   -> ['MATH']
@@ -104,20 +107,22 @@ is the regime the gating change is meant to protect and the one with no data.
 > pre-expanding is 1.35x faster on IDENTICAL work
 > ```
 >
-> **1.35×, not the 1.6–1.8× above** — the gap narrows at 64 new tokens because
+> **1.35x, not the 1.6 to 1.8x above.** The gap narrows at 64 new tokens because
 > prefill is a larger share of the run, and widens with decode length and batch.
 > Both are real; the repro is deliberately small so it finishes in seconds.
 > Pass `--batch 32 --new-tokens 512` to approach the table.
 >
-> **I have not run any of this on sm ≥ 80** — no Ampere-or-later device was
-> available — so what the script reports on sm_86 or sm_89 is unknown to me. If
+> **I have not run any of this on sm >= 80.** No Ampere-or-later device was
+> available, so what the script reports on sm_86 or sm_89 is unknown to me. If
 > FLASH can honour `enable_gqa` there, both columns should name the same backend
 > and the delta should collapse; that is a prediction, not a measurement.
 >
-> Not attached to any opinion on the fix — the `SDPAParams` / fullgraph blocker
-> in this thread is real and I have nothing to add on it. Flagging only that on
-> sm < 80 the fallback is not an edge case, it is the default path for unpadded
-> batches, and the size is closer to 1.6–1.8× end to end than to 2.5%.
+> No opinion on the fix itself. The `SDPAParams` / fullgraph blocker is real and
+> I have nothing to add on it, and the `+2.6%` probe overhead you measured is a
+> different quantity from anything above, since it is the cost of the check on
+> hardware where the fallback never fires. The only thing I am adding is that on
+> sm < 80 the fallback is not an edge case but the default path for unpadded
+> batches, and that it is worth 1.6 to 1.8x there.
 
 ---
 
@@ -127,19 +132,19 @@ is the regime the gating change is meant to protect and the one with no data.
 |---|---|
 | backends selected, both K/V forms | `kaggle/session5` gate 2, `kaggle/session3` |
 | FLASH/CUDNN reject every shape on sm_75 | `docs/AMPERE_RECHECK.md` item 2 |
-| 1.62× / 1.84× end to end, uniform mask-free batch | `bench/results/arms/arm{A,B}-control-rect{3072,1757}-C64.json`, baseline levels |
+| 1.62x / 1.84x end to end, uniform mask-free batch | `bench/results/arms/arm{A,B}-control-rect{3072,1757}-C64.json`, baseline levels |
 | `use_gqa_in_sdpa` returns True iff mask is None | transformers 5.12.1 and `main`, verified 2026-08 |
 | repro output, 1.35× at batch 8 / 64 new tokens | `kaggle/session9/session9_report.json` — script run standalone from a bare directory, rc=0 |
 | torch's own warning text | same run, verbatim from stderr |
 
-**Deliberately NOT included:** the per-attention-call gap (2.76×–5.67×) and the
-transient-memory ratio (3.3×–8.3×) from `kaggle/session4`. Those were measured
+**Deliberately NOT included:** the per-attention-call gap (2.76 to 5.67x) and the
+transient-memory ratio (3.3 to 8.3x) from `kaggle/session4`. Those were measured
 with an explicit boolean mask on **both** paths, which is this engine's shape,
 not HuggingFace's — HF's `enable_gqa` path only ever runs with `attn_mask=None`.
 They do not characterise HF's two shipped paths and would be wrong to offer
 upstream as if they did.
 
-Every figure is from a run that happened. The 1.62×/1.84× pair are **baseline
+Every figure is from a run that happened. The 1.62x / 1.84x pair are **baseline
 levels only** — the paged engine is not part of this comparison and should not
 be mentioned upstream; it is the HuggingFace baseline measured against itself
 with one boolean flipped.
