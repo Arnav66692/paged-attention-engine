@@ -81,11 +81,15 @@ different baseline.
 
 **And this is not the kernel.** On `control` the engine ships
 `repeat_kv`/`EFFICIENT_ATTENTION` while HuggingFace — whose uniform prompts
-collapse the mask to `None` — takes `enable_gqa` and lands on `MATH`. So in the
-shipping configuration **the engine holds the faster kernel here and still
-loses.** Arm B, where the baseline is forced onto `EFFICIENT` too and the
-advantage is removed, is the fairer of the two columns and the loss survives it
-at both sizings.
+collapse the mask to `None` — takes `enable_gqa` and lands on `MATH`. Neither
+column above is the shipped engine against unpatched HuggingFace: Arm A runs the
+engine on a GQA path it no longer ships, and Arm B patches the baseline. Pairing
+the shipped engine (Arm B's engine level) against unpatched HuggingFace (Arm A's
+baseline level), both from the same session and card, gives **1.28× at rect3072
+and 1.21× at rect1757** — a win, because there the unpatched baseline is the side
+on `MATH`. Arm B, where the baseline is forced onto `EFFICIENT` too and the
+kernel advantage is removed, is the like-for-like column, and the loss survives
+it at both sizings.
 
 **The mechanism.** The control stream is 256 requests of exactly 512 prompt and
 512 decode tokens. Every sequence starts together, grows at the same rate, and

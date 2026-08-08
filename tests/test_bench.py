@@ -17,6 +17,7 @@ forgotten.
 import json
 import subprocess
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -187,6 +188,239 @@ def test_baseline_result_records_the_rejection_rate():
         record["rejected_over_rectangle"] + record["rejected_by_engine_guard"]
     )
     assert record["num_accepted"] + record["num_rejected"] == record["num_offered"]
+
+
+# --- batch order: the only thing sorting is allowed to change ---------------
+
+
+class _OrderRecordingGenerator(_FakeGenerator):
+    """Also keeps the request ids of each batch, in the order they were cut."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.batches: list[tuple[str, ...]] = []
+
+    def generate_batch(self, batch):
+        self.batches.append(tuple(request.request_id for request in batch))
+        return super().generate_batch(batch)
+
+
+def _run_both_orders(stream, rectangle):
+    """The same stream under both orders, with every other constraint held."""
+    runs = {}
+    for order in baseline_mod.BATCH_ORDERS:
+        generator = _OrderRecordingGenerator()
+        ticks = iter([0.0, 1.0])
+        runs[order] = (
+            baseline_mod.run_baseline(
+                stream, generator, rectangle,
+                max_num_seqs=64, batch_order=order, clock=lambda: next(ticks),
+            ),
+            generator,
+        )
+    return runs
+
+
+def test_sorting_changes_batch_composition_and_nothing_else():
+    """The invariant the sorted measurement rests on.
+
+    Same requests completed, same token count for every one of them, same
+    acceptance, same rejection, same rectangle accounting. The only difference
+    permitted is which requests shared a batch and in what order.
+    """
+    stream = workload.build_stream("mixed", seed=0, c=64)
+    runs = _run_both_orders(stream, baseline_mod.RECTANGLE_P95)
+    arrival, arrival_gen = runs[baseline_mod.BATCH_ORDER_ARRIVAL]
+    sorted_, sorted_gen = runs[baseline_mod.BATCH_ORDER_SORTED]
+
+    print(f"\naccepted {arrival.num_accepted}, rejected {arrival.num_rejected}, "
+          f"{arrival.num_batches} batches either way")
+    print(f"  batch compositions differ: {arrival_gen.batches != sorted_gen.batches}")
+
+    # 1. The same request identities completed.
+    assert set(arrival.outputs) == set(sorted_.outputs)
+    assert len(arrival.outputs) == arrival.num_accepted
+
+    # 2. The same token count for every completed request.
+    assert {rid: len(tokens) for rid, tokens in arrival.outputs.items()} == {
+        rid: len(tokens) for rid, tokens in sorted_.outputs.items()
+    }
+
+    # 3. Every conserved quantity is identical. Acceptance, rejection and its
+    #    attribution, the token count, the rectangle accounting and the batch
+    #    count are all computed over `accepted`, so none of them may move.
+    #    Excluded are the three counters that ARE the order's consequence, and
+    #    which are checked for direction below, plus the injected clock.
+    order_derived = {
+        "batch_order", "elapsed_seconds",
+        "forward_passes", "decode_row_steps", "decode_step_efficiency",
+    }
+    left = {k: v for k, v in arrival.describe().items() if k not in order_derived}
+    right = {k: v for k, v in sorted_.describe().items() if k not in order_derived}
+    assert left == right, f"sorting moved more than the order: {left} vs {right}"
+    assert arrival.describe()["batch_order"] == baseline_mod.BATCH_ORDER_ARRIVAL
+    assert sorted_.describe()["batch_order"] == baseline_mod.BATCH_ORDER_SORTED
+
+    # 3b. The counters that may move are the ones grouping is supposed to move,
+    #     and they move the only way grouping can: fewer wasted decode steps for
+    #     the identical set of kept tokens.
+    print(f"  forward passes {arrival.forward_passes} -> {sorted_.forward_passes}; "
+          f"decode-step efficiency {arrival.decode_step_efficiency:.4f} -> "
+          f"{sorted_.decode_step_efficiency:.4f}")
+    assert sorted_.forward_passes < arrival.forward_passes
+    assert sorted_.decode_row_steps < arrival.decode_row_steps
+    assert sorted_.decode_step_efficiency > arrival.decode_step_efficiency
+    assert arrival.generated_tokens == sorted_.generated_tokens
+    # Efficiency cannot exceed 1: you never keep more than you computed.
+    assert sorted_.decode_step_efficiency <= 1.0
+
+    # 4. The difference is real: the batches were actually cut differently, and
+    #    the sorted run's batches are decode-homogeneous where arrival's are not.
+    assert arrival_gen.batches != sorted_gen.batches
+    assert sorted(sum(arrival_gen.batches, ())) == sorted(sum(sorted_gen.batches, ()))
+    assert arrival_gen.batch_sizes == sorted_gen.batch_sizes
+
+
+def test_sorting_does_not_touch_the_workload_stream():
+    """`bench/workload.py` is frozen; the sort must not reach back into it."""
+    stream = workload.build_stream("mixed", seed=0, c=32)
+    before = workload.stream_digest(stream)
+    ids_before = [request.request_id for request in stream]
+
+    baseline_mod.run_baseline(
+        stream, _FakeGenerator(), baseline_mod.RECTANGLE_P95,
+        max_num_seqs=32, batch_order=baseline_mod.BATCH_ORDER_SORTED,
+        clock=iter([0.0, 1.0]).__next__,
+    )
+
+    print(f"\nstream digest unchanged: {workload.stream_digest(stream) == before}")
+    assert workload.stream_digest(stream) == before
+    assert [request.request_id for request in stream] == ids_before
+
+
+def test_arrival_is_the_default_and_is_the_original_batching():
+    """The default must reproduce the batching every committed result used."""
+    stream = workload.build_stream("mixed", seed=0, c=32)
+    accepted, _ = baseline_mod.classify(stream, baseline_mod.RECTANGLE_P95)
+
+    default_gen = _OrderRecordingGenerator()
+    baseline_mod.run_baseline(
+        stream, default_gen, baseline_mod.RECTANGLE_P95, max_num_seqs=32,
+        clock=iter([0.0, 1.0]).__next__,
+    )
+    resident = min(baseline_mod.max_resident(baseline_mod.RECTANGLE_P95), 32)
+    expected = [
+        tuple(r.request_id for r in accepted[i : i + resident])
+        for i in range(0, len(accepted), resident)
+    ]
+
+    print(f"\ndefault cut {len(default_gen.batches)} batches in arrival order")
+    assert default_gen.batches == expected
+
+
+def test_sorted_is_descending_by_decode_budget_and_stable():
+    stream = workload.build_stream("mixed", seed=0, c=32)
+    accepted, _ = baseline_mod.classify(stream, baseline_mod.RECTANGLE_P95)
+    ordered = baseline_mod.order_for_batching(
+        accepted, baseline_mod.BATCH_ORDER_SORTED
+    )
+    budgets = [request.max_new_tokens for request in ordered]
+
+    print(f"\nsorted budgets: {budgets[:6]} ... {budgets[-6:]}")
+    assert budgets == sorted(budgets, reverse=True)
+    assert sorted(r.request_id for r in ordered) == sorted(
+        r.request_id for r in accepted
+    )
+    # Stable: equal budgets keep arrival order, so the order is a deterministic
+    # function of the stream rather than of the sort implementation.
+    arrival_index = {r.request_id: i for i, r in enumerate(accepted)}
+    for left, right in zip(ordered, ordered[1:]):
+        if left.max_new_tokens == right.max_new_tokens:
+            assert arrival_index[left.request_id] < arrival_index[right.request_id]
+
+
+def test_unknown_batch_order_raises_rather_than_defaulting():
+    stream = workload.build_stream("mixed", seed=0, c=8)
+    with pytest.raises(ValueError, match="unknown batch_order"):
+        baseline_mod.run_baseline(
+            stream, _FakeGenerator(), baseline_mod.RECTANGLE_P95,
+            batch_order="soretd", clock=iter([0.0, 1.0]).__next__,
+        )
+
+
+def test_session10_kernels_declare_the_batch_order_comparison_they_promise():
+    """The batch-order session must be Arm B, both orders, and the two mixed cells.
+
+    Same reason as the session6/session7 slice check: the kernels declare their
+    work as literals because Kaggle renames an uploaded script to script.py, so
+    the literals have to be checked against the tables they must agree with, in
+    the files that own those tables.
+    """
+    import ast
+
+    from bench.arms import ARMS
+
+    repo_root = Path(__file__).resolve().parent.parent
+    tables, declared, orders, paths = {}, {}, {}, {}
+    for candidate in sorted((repo_root / "kaggle").glob("session10?/session10?.py")):
+        for node in ast.walk(ast.parse(candidate.read_text())):
+            if not isinstance(node, ast.Assign):
+                continue
+            name = getattr(node.targets[0], "id", "")
+            if name == "SLICES":
+                tables[candidate.stem] = ast.literal_eval(node.value)
+            elif name == "SLICE":
+                declared[candidate.stem] = ast.literal_eval(node.value)
+            elif name == "ORDERS":
+                orders[candidate.stem] = ast.literal_eval(node.value)
+            elif name == "GQA_PATH":
+                paths[candidate.stem] = ast.literal_eval(node.value)
+    if not tables:
+        pytest.skip("no session10 kernels in this tree")
+
+    print(f"\nsession10 slices: {sorted(declared)}")
+    first = next(iter(tables.values()))
+    for stem, table in tables.items():
+        assert table == first, f"kaggle/{stem} carries a different slice table"
+        assert declared.get(stem) == stem, (
+            f"kaggle/{stem}/{stem}.py declares SLICE={declared.get(stem)!r} and "
+            "would measure another slice's cell"
+        )
+        # Arm B, because that is the arm the mixed headline is quoted from and
+        # the one where both sides run the same kernel.
+        assert paths[stem] == ARMS["B"]["gqa_path"], (
+            f"kaggle/{stem} declares GQA_PATH={paths[stem]!r}, not arm B's "
+            f"{ARMS['B']['gqa_path']!r}"
+        )
+        # Both orders, or the session measures one of them against nothing.
+        assert tuple(orders[stem]) == tuple(baseline_mod.BATCH_ORDERS), (
+            f"kaggle/{stem} runs {orders[stem]}, not {list(baseline_mod.BATCH_ORDERS)}"
+        )
+    assert set(declared) == set(first)
+
+    # The two cells are the mixed Arm B headline cells, at the sweep's own
+    # pressure level and both rectangle sizings.
+    assert {(c["stream"], c["rectangle"], c["concurrency"]) for c in first.values()} == {
+        ("mixed", rectangle, PRESSURE_C)
+        for rectangle in baseline_mod.RECTANGLE_SIZINGS
+    }
+
+
+def test_provenance_records_the_batch_order():
+    """It travels with the result, because a static tok/s means nothing without it."""
+    sorted_record = asdict(run_mod.Provenance.collect(
+        baseline_mod.BENCH_MODEL, "torch.float16", "digest",
+        baseline_batch_order=baseline_mod.BATCH_ORDER_SORTED,
+    ))
+    default_record = asdict(run_mod.Provenance.collect(
+        baseline_mod.BENCH_MODEL, "torch.float16", "digest",
+    ))
+
+    print(f"\nprovenance baseline_batch_order: "
+          f"explicit={sorted_record['baseline_batch_order']}, "
+          f"default={default_record['baseline_batch_order']}")
+    assert sorted_record["baseline_batch_order"] == baseline_mod.BATCH_ORDER_SORTED
+    assert default_record["baseline_batch_order"] == baseline_mod.BATCH_ORDER_ARRIVAL
 
 
 # --- passes, median, range, escalation -------------------------------------
@@ -390,6 +624,36 @@ def test_the_cli_refuses_to_measure_without_cuda_or_smoke():
     print(f"\nCLI without --smoke: exit {result.returncode}, {result.stderr.strip()}")
     assert result.returncode == 2
     assert "without CUDA" in result.stderr
+
+
+def test_the_cli_takes_the_batch_order_and_rejects_an_unknown_one():
+    """Both orders must be reachable from the command line, and typos must not run.
+
+    Neither invocation loads a model: argparse rejects the bad value, and the
+    good one reaches the no-CUDA refusal first. That is enough to prove the flag
+    is wired, and it costs no forward pass.
+    """
+    bad = subprocess.run(
+        [sys.executable, "-m", "bench.run", "--stream", "mixed", "-C", "1",
+         "--smoke", "--baseline-order", "soretd"],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=300,
+    )
+    print(f"\nCLI --baseline-order soretd: exit {bad.returncode}")
+    assert bad.returncode != 0
+    assert "baseline-order" in bad.stderr
+
+    for order in baseline_mod.BATCH_ORDERS:
+        good = subprocess.run(
+            [sys.executable, "-m", "bench.run", "--stream", "mixed", "-C", "1",
+             "--baseline-order", order],
+            cwd=REPO_ROOT, capture_output=True, text=True, timeout=300,
+        )
+        print(f"  --baseline-order {order}: exit {good.returncode}")
+        if torch.cuda.is_available():
+            continue
+        # Parsed, then stopped by the CUDA rule rather than by the flag.
+        assert good.returncode == 2
+        assert "without CUDA" in good.stderr
 
 
 def test_the_cli_rejects_a_headline_at_the_wrong_level():

@@ -256,6 +256,12 @@ class Provenance:
     # a ratio is only interpretable next to them.
     gqa_path: str
     baseline_kv_expansion_forced: bool
+    # WHICH ORDER THE BASELINE CUT ITS BATCHES IN. `arrival` is the naive
+    # batching the headline was measured against; `sorted` groups the accepted
+    # list by decode budget first. A static-batch throughput number is not
+    # interpretable without it, because the two differ by how much of the batch
+    # is rows that already finished.
+    baseline_batch_order: str
     max_num_batched_tokens: int | None
     # Whether the UNPATCHED baseline pre-expands K/V on this cell's own stream.
     # Decides whether Arm B moved the baseline or only the engine, which decides
@@ -267,6 +273,7 @@ class Provenance:
         cls, model_id: str, dtype: str, stream_digest: str,
         *, baseline_kv_expansion_forced: bool = False,
         baseline_expands_kv_unpatched: bool | None = None,
+        baseline_batch_order: str = baseline_mod.BATCH_ORDER_ARRIVAL,
     ) -> "Provenance":
         return cls(
             num_gpu_blocks=NUM_GPU_BLOCKS,
@@ -304,6 +311,7 @@ class Provenance:
             # what the kernel calls actually obeyed.
             gqa_path=attention_mod.GQA_PATH,
             baseline_kv_expansion_forced=baseline_kv_expansion_forced,
+            baseline_batch_order=baseline_batch_order,
             max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
             baseline_expands_kv_unpatched=baseline_expands_kv_unpatched,
         )
@@ -333,6 +341,16 @@ class LevelResult:
     throughput_valid: bool = True
     pool_trace: tuple[tuple[int, int, int, str], ...] = ()
     trace_events_total: int = 0
+    num_batches: int | None = None
+    forward_passes: int | None = None
+    decode_row_steps: int | None = None
+
+    @property
+    def decode_step_efficiency(self) -> float | None:
+        """Kept decode tokens over decode row-steps. Baseline-only; None for the engine."""
+        if not self.decode_row_steps:
+            return None
+        return self.generated_tokens / self.decode_row_steps
 
     @property
     def median_seconds(self) -> float:
@@ -383,6 +401,13 @@ class LevelResult:
             "peak_blocks_used": self.peak_blocks_used,
             "rectangle_tokens": self.rectangle_tokens,
             "max_resident": self.max_resident,
+            "num_batches": self.num_batches,
+            "forward_passes": self.forward_passes,
+            "decode_row_steps": self.decode_row_steps,
+            "decode_step_efficiency": (
+                round(self.decode_step_efficiency, 6)
+                if self.decode_step_efficiency is not None else None
+            ),
             "unresolved": self.unresolved,
             "throughput_valid": self.throughput_valid,
             "pool_trace": [list(point) for point in self.pool_trace],
@@ -427,6 +452,12 @@ class EnginePass:
     # decision. Capacity against occupancy, which is the measured fragmentation.
     pool_trace: tuple[tuple[int, int, int, str], ...] = ()
     trace_events_total: int = 0
+    # BASELINE-ONLY BATCHING COUNTERS, None for the engine. What the static
+    # batching issued, so its throughput can be read against the work it ran and
+    # not only against the work it was credited for.
+    num_batches: int | None = None
+    forward_passes: int | None = None
+    decode_row_steps: int | None = None
 
 
 def run_engine_pass(
@@ -648,6 +679,9 @@ def measure_level(
             # history. Keeping the last is arbitrary and sufficient.
             result.pool_trace = observed.pool_trace
             result.trace_events_total = observed.trace_events_total
+            result.num_batches = observed.num_batches
+            result.forward_passes = observed.forward_passes
+            result.decode_row_steps = observed.decode_row_steps
             log(f"    pass {index + 1}/{count}: {observed.elapsed:.4f}s")
 
     collect(MEASURED_PASSES)
@@ -786,18 +820,21 @@ def _engine_factory(engine, cache_factory):
     return factory
 
 
-def _baseline_factory(generator):
+def _baseline_factory(generator, batch_order=baseline_mod.BATCH_ORDER_ARRIVAL):
     def factory(stream, rectangle_tokens, max_num_seqs):
         def run_pass() -> EnginePass:
             observed = baseline_mod.run_baseline(
                 stream, generator, rectangle_tokens, synchronize=_cuda_sync,
-                max_num_seqs=max_num_seqs,
+                max_num_seqs=max_num_seqs, batch_order=batch_order,
             )
             return EnginePass(
                 elapsed=observed.elapsed_seconds,
                 generated_tokens=observed.generated_tokens,
                 preemptions=0,  # a static batch has nothing to preempt
                 num_rejected=observed.num_rejected,
+                num_batches=observed.num_batches,
+                forward_passes=observed.forward_passes,
+                decode_row_steps=observed.decode_row_steps,
                 peak_blocks_used=0,
             )
 
@@ -833,6 +870,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         help=(
             "Arm B: force the baseline to pre-expand K/V so it lands on the "
             "same kernel as GQA_PATH=repeat_kv. Gated on token identity."
+        ),
+    )
+    parser.add_argument(
+        "--baseline-order", choices=baseline_mod.BATCH_ORDERS,
+        default=baseline_mod.BATCH_ORDER_ARRIVAL,
+        help=(
+            "order the baseline cuts its batches in. 'arrival' is the naive "
+            "batching and the default; 'sorted' groups the accepted list by "
+            "decode budget first. Acceptance and every token count are "
+            "unaffected."
         ),
     )
     args = parser.parse_args(argv)
@@ -911,12 +958,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.model, str(dtype), workload.stream_digest(reference),
         baseline_kv_expansion_forced=args.baseline_expand_kv,
         baseline_expands_kv_unpatched=baseline_expands_unpatched,
+        baseline_batch_order=args.baseline_order,
     )
 
     results = sweep(
         concurrencies, args.stream, args.seed,
         _engine_factory(engine, cache_factory),
-        _baseline_factory(generator),
+        _baseline_factory(generator, args.baseline_order),
         rectangle_tokens=args.rectangle,
         headline=args.headline,
         throughput_valid=not args.smoke and torch.cuda.is_available(),

@@ -38,9 +38,8 @@ is the regime the gating change is meant to protect and the one with no data.
 > no backend that can honour it and the fallback fires unconditionally rather
 > than at the margins.
 >
-> **Which backend actually runs.** Determined by pinning each backend with
-> `sdpa_kernel(...)` and comparing bit-for-bit against the unrestricted call,
-> not inferred from shapes:
+> **Which backend gets selected.** Determined by pinning each backend with
+> `sdpa_kernel(...)` and comparing bit-for-bit against the unrestricted call:
 >
 > | K/V form | `enable_gqa` | backend selected on sm_75 |
 > |---|---|---|
@@ -52,20 +51,20 @@ is the regime the gating change is meant to protect and the one with no data.
 >
 > **What it costs, end to end.** Qwen2.5-1.5B-Instruct, fp16, real
 > `model.generate()`, 256 requests of 512 prompt + 512 decode tokens, median of
-> 3 measured passes after a discarded warmup (pass spread ≤ 0.2%). The only
+> 3 measured passes after a discarded warmup (pass spread under 0.2%). The only
 > change is forcing `use_gqa_in_sdpa` to return `False`:
 >
-> | batch shape | as shipped | K/V pre-expanded | speedup |
+> | concurrent sequences | as shipped | K/V pre-expanded | speedup |
 > |---|---|---|---|
-> | 18 resident | 177.8 tok/s | 288.9 tok/s | **1.62x** |
-> | 32 resident | 202.0 tok/s | 370.9 tok/s | **1.84x** |
+> | 18 | 177.8 tok/s | 288.9 tok/s | **1.62x** |
+> | 32 | 202.0 tok/s | 370.9 tok/s | **1.84x** |
 >
 > Identical work in both columns. Same prompts, same token counts, greedy,
 > `min_new_tokens == max_new_tokens`, and the batch is uniform so
 > `attention_mask` is `None` on both sides. The only difference is the return
 > value of `use_gqa_in_sdpa`.
 >
-> **The part I think is worth calling out separately.** On CUDA with torch >= 2.5,
+> **The part I think is worth calling out separately.** On CUDA with torch 2.5 or newer,
 > `use_gqa_in_sdpa()` returns `True` exactly when `attention_mask is None`, which
 > for `generate()`
 > means exactly when nothing was left-padded. So on sm < 80 the consequence is
@@ -79,8 +78,8 @@ is the regime the gating change is meant to protect and the one with no data.
 > No warning, no fallback message, and the configuration that looks optimal,
 > a uniform batch with no padding waste, is the one that loses 1.6 to 1.8x.
 >
-> **torch says why, in its own words.** Running the pinned-backend probe emits,
-> verbatim:
+> **torch says why, in its own words.** Running the pinned-backend probe emits
+> these two warnings, rewrapped here and trimmed after `instead.`:
 >
 > ```
 > Flash attention only supports gpu architectures in the range [sm80, sm121].
@@ -90,14 +89,15 @@ is the regime the gating change is meant to protect and the one with no data.
 >   Key sizes(): [8, 2, 512, 128], Value sizes(): [8, 2, 512, 128] instead.
 > ```
 >
-> The second line is the whole thing: the unexpanded K/V shape is *why* both
+> The second warning is the mechanism this PR already describes: the
+> unexpanded K/V shape is *why* both
 > fused kernels decline, and `enable_gqa=True` is what produces that shape.
 >
 > **Standalone repro attached.** Two `generate()` calls doing identical work on
 > the same uniform batch, one as shipped and one with pre-expansion forced,
 > printing the selected backend for each and the timing delta. Its own default
 > shape is smaller than the table above, batch 8 with 512-token prompts and 64
-> new tokens, and on the T4 it reports:
+> new tokens, and on the T4 it reports (abridged):
 >
 > ```
 > uniform batch, as HF ships it    enable_gqa=True   -> ['MATH']
@@ -115,13 +115,13 @@ is the regime the gating change is meant to protect and the one with no data.
 > deliberately small so it finishes in seconds. Pass
 > `--batch 32 --new-tokens 512` to move it toward the table.
 >
-> **I have not run any of this on sm >= 80.** No Ampere-or-later device was
+> **I have not run any of this on Ampere or later.** No such device was
 > available, so what the script reports on sm_86 or sm_89 is unknown to me. If
 > FLASH can honour `enable_gqa` there, both columns should name the same backend
 > and the delta should collapse; that is a prediction, not a measurement.
 >
 > No opinion on the fix itself. The `SDPAParams` / fullgraph blocker is real and
-> I have nothing to add on it, and the `+2.6%` probe overhead you measured is a
+> I have nothing to add on it, and the `+2.6%` probe overhead in the thread is a
 > different quantity from anything above, since it is the cost of the check on
 > hardware where the fallback never fires. The only thing I am adding is that on
 > sm < 80 the fallback is not an edge case but the default path for unpadded

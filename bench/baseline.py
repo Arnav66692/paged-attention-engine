@@ -19,6 +19,21 @@ and the whole of Gate 1 is the claim that dividing the same bytes the second way
 is worse. Nothing else about the baseline is handicapped, and nothing is padded
 in its favour either.
 
+THE CEILING IS A BUDGETING RULE, NOT AN OBSERVED LIMIT, AND ON ONE SIZING IT IS
+EXCEEDED. `max_resident` charges every resident sequence `rectangle_tokens`
+slots, but HuggingFace's cache actually holds
+`resident * (longest_prompt_in_batch + longest_decode_in_batch)` slots, and those
+two maxima come from DIFFERENT requests -- so a batch whose members each fit the
+rectangle can still exceed `resident * rectangle_tokens`. Computed directly from
+the frozen stream at C=64: on `control` no batch exceeds the ceiling at either
+sizing, and on `mixed` at rect3072 none does (worst batch 55,296 of 57,344
+slots), but on `mixed` at rect1757 SEVEN OF EIGHT BATCHES DO, the mean batch
+demanding 68,364 slots and the worst 77,216 -- 34.7% over. Nothing here or in
+`bench/run.py` records `torch.cuda.max_memory_allocated`, so neither side's real
+KV residency was ever observed. "Both sides get the same KV bytes" holds as
+arithmetic on the rectangle, and holds on the device only where the realized
+demand above stays under the ceiling.
+
 NOT A PROCESS-WIDE MEMORY FRACTION. It would be much easier to cap the baseline
 with `torch.cuda.set_per_process_memory_fraction` and let it OOM, and it would
 be wrong: that budget also has to hold the weights, the activations and every
@@ -107,6 +122,45 @@ class RejectionReason:
     OVER_RECTANGLE = "longer_than_rectangle"
 
 
+# --- batch order -----------------------------------------------------------
+#
+# THE ONE THING THE BASELINE IS ALLOWED TO VARY, AND IT IS NOT FREE TO THE
+# COMPARISON. A static batch runs every row until the batch's longest member
+# finishes its budget, so mixing a 1024-token decode with an 8-token decode
+# makes the short row compute 1016 positions nobody reads. Grouping by decode
+# length is the cheapest thing a static batcher can do about that, so a headline
+# measured against the arrival-order form is measured against the weaker of two
+# static batchers, and the gap between them is a number rather than an argument.
+#
+# `arrival` is the default and is the original behaviour, byte for byte.
+# `sorted` reorders the ALREADY-ACCEPTED list and nothing else: acceptance,
+# rejection, the rectangle, `max_resident`, the KV ceiling and every token count
+# are computed before it and are order-invariant afterwards. The workload stream
+# is not touched -- `classify` returns a fresh tuple and this sorts a copy of it.
+#
+# Descending, and via a stable sort, so requests of equal budget keep their
+# arrival order and the batching is a deterministic function of the stream.
+BATCH_ORDER_ARRIVAL = "arrival"
+BATCH_ORDER_SORTED = "sorted"
+BATCH_ORDERS = (BATCH_ORDER_ARRIVAL, BATCH_ORDER_SORTED)
+
+
+def order_for_batching(accepted: Sequence[Request], batch_order: str) -> tuple[Request, ...]:
+    """The accepted list in the order batches are cut from it.
+
+    Raises rather than defaulting on an unknown value: a typo that silently
+    fell back to `arrival` would report a sorted measurement that never sorted,
+    which is the one failure mode that looks like a clean result.
+    """
+    if batch_order == BATCH_ORDER_ARRIVAL:
+        return tuple(accepted)
+    if batch_order == BATCH_ORDER_SORTED:
+        return tuple(sorted(accepted, key=lambda request: -request.max_new_tokens))
+    raise ValueError(
+        f"unknown batch_order {batch_order!r}, expected one of {list(BATCH_ORDERS)}"
+    )
+
+
 @dataclass(frozen=True)
 class Rejection:
     request_id: str
@@ -162,6 +216,7 @@ class BaselineResult:
     rectangle_tokens: int
     max_resident: int
     max_num_seqs: int | None
+    batch_order: str
     num_offered: int
     num_accepted: int
     num_rejected: int
@@ -169,6 +224,13 @@ class BaselineResult:
     rejected_over_rectangle: int
     generated_tokens: int
     num_batches: int
+    # WHAT THE BATCHING ACTUALLY COST, so a static tok/s can be read against the
+    # work it issued rather than against the work it was credited for. Counted,
+    # not derived from the timing: `forward_passes` is one prefill plus `steps`
+    # decode steps per batch, and `decode_row_steps` is those decode steps times
+    # the rows that sat through them. `generated_tokens` is what was kept.
+    forward_passes: int
+    decode_row_steps: int
     padded_token_slots: int
     used_token_slots: int
     elapsed_seconds: float
@@ -177,6 +239,15 @@ class BaselineResult:
     @property
     def rejection_rate(self) -> float:
         return self.num_rejected / self.num_offered if self.num_offered else 0.0
+
+    @property
+    def decode_step_efficiency(self) -> float:
+        """Kept decode tokens over decode row-steps computed. 1.0 wastes nothing."""
+        return (
+            self.generated_tokens / self.decode_row_steps
+            if self.decode_row_steps
+            else 0.0
+        )
 
     @property
     def slot_waste(self) -> float:
@@ -192,6 +263,7 @@ class BaselineResult:
             "rectangle_tokens": self.rectangle_tokens,
             "max_resident": self.max_resident,
             "max_num_seqs": self.max_num_seqs,
+            "batch_order": self.batch_order,
             "num_offered": self.num_offered,
             "num_accepted": self.num_accepted,
             "num_rejected": self.num_rejected,
@@ -200,6 +272,9 @@ class BaselineResult:
             "rejection_rate": round(self.rejection_rate, 6),
             "generated_tokens": self.generated_tokens,
             "num_batches": self.num_batches,
+            "forward_passes": self.forward_passes,
+            "decode_row_steps": self.decode_row_steps,
+            "decode_step_efficiency": round(self.decode_step_efficiency, 6),
             "padded_token_slots": self.padded_token_slots,
             "used_token_slots": self.used_token_slots,
             "slot_waste": round(self.slot_waste, 6),
@@ -281,6 +356,7 @@ def run_baseline(
     *,
     ceiling_bytes: int = KV_POOL_BYTES,
     max_num_seqs: int | None = None,
+    batch_order: str = BATCH_ORDER_ARRIVAL,
     clock: Callable[[], float] = time.perf_counter,
     synchronize: Callable[[], None] | None = None,
 ) -> BaselineResult:
@@ -288,8 +364,9 @@ def run_baseline(
 
     `clock` and `synchronize` are injected so a test can drive this with a fake
     generator and a fake clock and check the accounting without measuring
-    anything. Nothing else in this function is configurable: the batching is the
-    naive batching on purpose.
+    anything. `batch_order` is the one knob: `arrival` is the naive batching, on
+    purpose and by default, and `sorted` groups the accepted list by decode
+    budget before cutting batches. Nothing else here is configurable.
     """
     resident = max_resident(rectangle_tokens, ceiling_bytes)
     # THE SAME CONCURRENCY CAP THE ENGINE GETS. Without it a sweep at C compares
@@ -301,8 +378,12 @@ def run_baseline(
         resident = min(resident, max_num_seqs)
     accepted, rejected = classify(requests, rectangle_tokens)
 
+    # ORDER ONLY, AND ONLY HERE. Acceptance is already decided above and every
+    # count below is taken over `accepted`, not over `ordered`, so the two modes
+    # differ in which requests share a batch and in nothing else.
+    ordered = order_for_batching(accepted, batch_order)
     batches = [
-        accepted[start : start + resident] for start in range(0, len(accepted), resident)
+        ordered[start : start + resident] for start in range(0, len(ordered), resident)
     ]
 
     if synchronize is not None:
@@ -320,10 +401,21 @@ def run_baseline(
     padded = len(batches) * resident * rectangle_tokens
     used = sum(request.total_len for request in accepted)
 
+    # What the batching issued. One prefill plus `steps` decode steps per batch,
+    # where `steps` is the batch's longest budget -- the same rule
+    # `generate_batch` runs by, restated here rather than measured, so the count
+    # is a property of the batching and not of the model.
+    steps_per_batch = [max(request.max_new_tokens for request in batch) for batch in batches]
+    forward_passes = sum(1 + steps for steps in steps_per_batch)
+    decode_row_steps = sum(
+        steps * len(batch) for steps, batch in zip(steps_per_batch, batches)
+    )
+
     return BaselineResult(
         rectangle_tokens=rectangle_tokens,
         max_resident=resident,
         max_num_seqs=max_num_seqs,
+        batch_order=batch_order,
         num_offered=len(requests),
         num_accepted=len(accepted),
         num_rejected=len(rejected),
@@ -335,6 +427,8 @@ def run_baseline(
         ),
         generated_tokens=sum(len(tokens) for tokens in outputs.values()),
         num_batches=len(batches),
+        forward_passes=forward_passes,
+        decode_row_steps=decode_row_steps,
         padded_token_slots=padded,
         used_token_slots=used,
         elapsed_seconds=elapsed,

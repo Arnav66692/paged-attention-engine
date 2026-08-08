@@ -31,35 +31,100 @@ outputs = scheduler.run_to_completion()      # {request_id: (token, ...)}
 
 ---
 
-## The result
+## The result: the engine loses to a static batcher that sorts its input
 
 Engine tokens/s over baseline tokens/s, Kaggle Tesla T4, fp16, both sides
 holding the same 1,644,167,168-byte KV ceiling.
 
-| request stream | ratio |
-|---|---|
-| **ragged** — 120/224/288 distinct prompt lengths, 40–2048 tokens | **1.89× – 2.06×** at C=32, 64, 87 and both cache sizings |
-| **uniform** — every prompt 512 + 512 | **0.66× – 0.79×** — a loss |
+The ragged-stream win this project was built around holds only against a static
+batcher that batches in **arrival order**. Sorting the baseline's accepted
+requests by decode length before batching — one line, no paging, no continuous
+batching — reverses it:
+
+| request stream | baseline batches in arrival order | baseline batches decode-sorted |
+|---|---|---|
+| **ragged**, rect3072, C=64 | **1.91×** | **0.73×** — a loss |
+| **ragged**, rect1757, C=64 | **1.89×** | **0.67×** — a loss |
+| **uniform** — every prompt 512 + 512 | **0.66× – 0.79×** — a loss | not measured |
+
+Both columns of a row were measured in one Kaggle session on one T4, with the
+engine rerun alongside each baseline; the engine landed within 0.03% of itself
+across the two runs of each cell. `bench/results/batch-order/`.
+
+**What the gap between the two columns measures.** A static batch runs every row
+until the batch's longest member finishes its budget, so a 1024-token decode
+sharing a batch with an 8-token decode makes the short row compute 1016
+positions nobody reads. Grouping by decode length removes most of that: measured
+decode-step efficiency goes from 0.313 to 0.862 at rect3072 and from 0.254 to
+0.732 at rect1757, and baseline forward passes fall 2.8× and 2.9×. The engine's
+own throughput does not move. So the ragged-stream number is a measurement of
+how much waste the baseline's batching order leaves on the table, and it is
+sensitive to a choice the baseline was making badly.
 
 **The opponent is weak and that matters.** Naive static-batch `generate` is not
 vLLM, TGI, or anything in production, and none of those were ever benchmarked
-here. Beating static batching on a stream whose prompts span 40 to 2048 tokens
-is close to the arithmetic you would estimate on a napkin. The uniform-stream
-loss is the more informative half: with no straggler waste and no fragmentation
-there is nothing for the engine to reclaim, so it pays its own bookkeeping for
-no return.
+here. The uniform-stream loss was already the more informative half: with no
+straggler waste and no fragmentation there is nothing for the engine to reclaim,
+so it pays its own bookkeeping for no return. The sorted-baseline result extends
+that to the ragged stream — once the baseline stops wasting decode steps, the
+engine's bookkeeping is not paid for there either.
+
+**What is not claimed.** This does not show that paging or continuous batching
+are worthless; it shows that this benchmark never isolated their contribution,
+because the margin it reported is recoverable by reordering a list. A comparison
+that would isolate it has not been run.
 
 **The ragged ratio depends on both sides running the same attention backend, and
 getting that wrong in either direction moves it by 2×.** Under this engine's
 previous default it sat on `MATH` while HuggingFace's ragged batches already had
-`EFFICIENT_ATTENTION` — same code, same stream, 0.94× instead of 1.89×. Any
+`EFFICIENT_ATTENTION` — same code, same stream, 0.94× instead of 1.89× against
+the arrival-order baseline. Any
 benchmark of this kind is one silent kernel selection away from being a kernel
-comparison. [`bench/arms.py`](bench/arms.py) runs the whole sweep twice to bound
-it: the shared kernel is worth a measured ±5%, and the sign is not constant
-(+2.30% at one cache sizing, −4.77% at the other).
+comparison. [`bench/arms.py`](bench/arms.py) runs both arms on the four `C=64`
+cells to bound it — the `C=32` and `C=87` cells are Arm B only. On the two
+`control` cells, the only ones where the patch moves the baseline as well as the
+engine, the shared kernel moved the ratio by +2.30% and −4.77%: a few percent,
+and the sign is not constant.
 
 Full tables, the refuted hypotheses, and the rejection confound:
 **[`docs/FINDINGS.md`](docs/FINDINGS.md)**.
+
+### What this benchmark does not measure
+
+Every measurement here was taken on one Kaggle Tesla T4 (sm_75). No
+Ampere-or-later device has run this code, and FLASH is unavailable for every
+shape this benchmark issues on sm_75, so the ratio should not be expected to
+transfer to hardware where it is available.
+
+One model was measured: Qwen2.5-1.5B-Instruct in fp16, 28 layers over 2 KV
+heads. KV is cheap relative to compute at that shape, and no second model, size,
+or dtype was run.
+
+The baseline is naive static-batch `model.generate()` with EOS disabled. No
+production serving engine was benchmarked. Both batching orders are now
+measured, and the ragged-stream margin does not survive the sorted one.
+
+The KV ceiling of 1,644,167,168 bytes is a chosen constant, roughly a tenth of
+the card. Every stream measured would fit in the T4's free memory at once, so
+the capacity pressure is a parameter of the benchmark rather than a property of
+the device, and no sensitivity analysis of it exists.
+
+The request stream is synthetic: lognormal prompt and decode lengths with no
+trace behind the parameters, uniformly random token IDs so no two requests share
+a prefix, all requests present at t=0, and one seed. Sensitivity to the
+dispersion, to prefix sharing, to an arrival process, and to the seed is
+unmeasured.
+
+Most of the ragged-stream margin against the arrival-order baseline is one
+attention-kernel choice: switching the engine's GQA path from `sdpa` to
+`repeat_kv` roughly halved its time while the baseline moved 0.04%, and under
+the previous default the engine lost at 0.94x. That choice matters here because
+FLASH is unavailable on sm_75; on hardware where it is available the effect is
+unmeasured.
+
+Only aggregate throughput at saturation is measured. There is no time-to-first-
+token, no per-request latency, no tail percentile, and no single-request number
+anywhere in this repository.
 
 ---
 
@@ -98,8 +163,8 @@ Standalone reproduction, torch + transformers only:
 [`docs/upstream/repro_enable_gqa_padding_cliff.py`](docs/upstream/repro_enable_gqa_padding_cliff.py).
 Its defaults are smaller than the table — batch 8, 64 new tokens — and it reports
 roughly **1.3×** (1.35 and 1.26 on two runs); the gap widens with decode length and batch. Written up on its own at
-[`docs/hf-padding-kernel-cliff.md`](docs/hf-padding-kernel-cliff.md) and reported
-upstream on
+[`docs/hf-padding-kernel-cliff.md`](docs/hf-padding-kernel-cliff.md). Not yet
+reported upstream; the thread it belongs on is
 [huggingface/transformers#45776](https://github.com/huggingface/transformers/issues/45776),
 which already describes the mechanism but has no sm_75 data.
 
@@ -130,7 +195,9 @@ guard is broken.
   memory — otherwise the baseline loses for having less room for everything,
   rather than for what its rectangle wastes.
 - **Rejection is shared code.** `is_admissible` is called by the engine and the
-  baseline, so "rejected identically" is literally true.
+  baseline, so a request that predicate refuses is refused identically on both
+  sides. In these runs it refused nothing: every rejection in the result files is
+  the baseline's own rectangle limit, which the engine has no analogue for.
 - **Guards refuse rather than warn.** A C=64 control run recording zero
   preemptions raises: eviction is arithmetically forced there, so zero means the
   run measured something else.

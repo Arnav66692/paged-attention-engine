@@ -109,7 +109,7 @@ OF THE KERNEL — it flips between the two rectangle sizings.** Neither "floor" 
 cells — same generated tokens, preemptions, peak blocks, rejections and
 `workload_digest`, no provenance drift outside the two knobs — so the shifts are
 attributable to the kernel and the disagreement is real, not noise. The intervals
-are tight enough (≤0.2%) that a 2–5% shift is comfortably resolvable.
+are tight enough (≤0.31% wide) that a 2–5% shift is comfortably resolvable.
 
 **What actually decides the sign: which side gains more from the switch.**
 
