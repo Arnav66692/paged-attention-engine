@@ -51,3 +51,8 @@ service-account*.json
 # things visible in a bare `ls` of the repo.
 /c.txt
 /session*_report.json
+
+# The batch-order results are CITED BY THE README, so they ship. Everything
+# else under bench/results/ is scratch output and stays ignored.
+!bench/results/batch-order/
+!bench/results/batch-order/**

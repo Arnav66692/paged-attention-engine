@@ -227,8 +227,16 @@ def calibrate() -> dict:
     stream = workload.build_stream("mixed", 0, 64)
     useful = sum(r.max_new_tokens for r in stream)
 
+    found = sorted(Path("bench/results/batch-order").glob("*.json"))
+    if not found:
+        raise FileNotFoundError(
+            "bench/results/batch-order/ holds no result files. That directory "
+            "is gitignored, so it is absent from any fresh clone and from the "
+            "Kaggle dataset. Calibration cannot run without it; pass the "
+            "arrival rate in directly instead (bench/arrival_bench --rate)."
+        )
     measured = []
-    for path in sorted(Path("bench/results/batch-order").glob("*.json")):
+    for path in found:
         payload = json.loads(path.read_text())
         engine = next(l for l in payload["levels"] if l["engine"] == "engine")
         measured.append(engine["median_seconds"] / useful * 1e6)

@@ -54,7 +54,9 @@ started = time.perf_counter()
 done = subprocess.run(
     [sys.executable, "-m", "bench.arrival_bench",
      "--rho", "0.4", "--rectangle", "3072", "--seed", "0",
-     "--max-num-seqs", "64", "--passes", "3", "--out", str(out)],
+     "--max-num-seqs", "64", "--passes", "3",
+     "--rate", "0.196279",          # rho=0.4 x the Stage 1 saturated rate
+     "--out", str(out)],
     env=dict(os.environ),
 )
 elapsed = time.perf_counter() - started

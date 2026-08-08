@@ -265,6 +265,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--model", default=baseline_mod.BENCH_MODEL)
     parser.add_argument("--out", type=Path,
                         default=Path("bench/results/arrival/stage2.json"))
+    parser.add_argument(
+        "--rate", type=float, default=None,
+        help=("arrivals per second. Computed from the Stage 1 simulator when "
+              "omitted, which needs bench/results/batch-order/ on disk. That "
+              "directory is gitignored and so is absent from the measurement "
+              "host, where the calibration died with 'mean requires at least "
+              "one data point'. Pass the rate to remove the dependency."))
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args(argv)
 
@@ -277,11 +284,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     resident = baseline_mod.max_resident(args.rectangle)
 
     # The offered load is defined against the SORTED batcher's saturated service
-    # rate, computed by the Stage 1 simulator so both stages mean the same thing
-    # by "rho". Nothing about the arrival times depends on the GPU.
-    arrival_mod.calibrate()
-    saturated_rate, _ = arrival_mod.sweep(resident, args.max_num_seqs, [args.rho], args.seed)
-    rate = args.rho * saturated_rate
+    # rate, so both stages mean the same thing by "rho". That rate comes from
+    # the Stage 1 simulator, which reads measured results off disk -- so it is
+    # computed on the development machine and passed in, rather than recomputed
+    # on a host that does not have those files.
+    if args.rate is not None:
+        rate = args.rate
+        saturated_rate = rate / args.rho if args.rho else float("nan")
+    else:
+        arrival_mod.calibrate()
+        saturated_rate, _ = arrival_mod.sweep(
+            resident, args.max_num_seqs, [args.rho], args.seed)
+        rate = args.rho * saturated_rate
     arrivals = arrival_mod.poisson_arrivals(stream, rate=rate, seed=args.seed)
     print(f"rho={args.rho}  lambda={rate:.5f} req/s  "
           f"arrival span {arrivals[-1].arrives_at / 60:.1f} min  "
