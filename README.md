@@ -69,6 +69,51 @@ so it pays its own bookkeeping for no return. The sorted-baseline result extends
 that to the ragged stream — once the baseline stops wasting decode steps, the
 engine's bookkeeping is not paid for there either.
 
+### The other regime: under an arrival process, the engine wins on latency
+
+The table above gives the sorted batcher every request at `t=0`, which is the
+best case it will ever have: it selects 18 near-identical decode lengths out of
+a pool of 256. A serving engine's actual job is requests that arrive over time,
+and a sorted batcher cannot sort what has not arrived.
+
+Measured with a seeded Poisson arrival process layered over the same frozen
+stream, at 40% of the sorted batcher's saturated service rate. One T4, one
+session, passes interleaved, 1 warmup and 3 measured:
+
+| metric | sorted static batcher | engine | ratio |
+|---|---|---|---|
+| TTFT p50 | 9.464 s | 0.176 s | **53.8×** |
+| TTFT p99 | 76.281 s | 1.132 s | **67.4×** |
+| latency p50 | 28.728 s | 5.747 s | **5.00×** |
+| latency p99 | 111.240 s | 35.961 s | **3.09×** |
+| wall clock | 23.1 min | 23.1 min | 1.00× |
+
+Wall clock is identical because below saturation both schedulers complete every
+request and both match the arrival rate. Throughput is not the metric here and
+would say nothing.
+
+**The mechanism, measured.** Mean queue depth at batch formation was **3.0**
+against a batch size of 18, and 36 of 87 batches formed with a single request
+queued. The sort is not merely weakened, it is frequently a literal no-op.
+Meanwhile the static batcher admits nothing until its current batch drains, so a
+request arriving just after a batch forms waits for that batch's longest member
+before it is even prefilled. Realized decode efficiency was 0.495, against 0.862
+with the whole stream present.
+
+**This is a textbook result, not a discovery.** Admitting into free slots while a
+static batcher drains first is the entire reason continuous batching exists, and
+every serving system built in the last three years does it. This measures that
+the engine implements it correctly. It does not make the engine competitive with
+anything in production, and it does not rehabilitate the throughput claim above.
+
+It was **pre-registered** before the run, with the prediction, the threshold and
+the refutation branch written down first: [`docs/PREREG_arrival.md`](docs/PREREG_arrival.md).
+The simulation that justified spending the GPU time overestimated the TTFT ratio
+by an order of magnitude, and that is recorded there too.
+
+**Both regimes together:** the engine loses on throughput when the whole workload
+is known in advance, and wins on latency when it is not.
+
 **What is not claimed.** This does not show that paging or continuous batching
 are worthless; it shows that this benchmark never isolated their contribution,
 because the margin it reported is recoverable by reordering a list. A comparison
@@ -122,8 +167,9 @@ the previous default the engine lost at 0.94x. That choice matters here because
 FLASH is unavailable on sm_75; on hardware where it is available the effect is
 unmeasured.
 
-Only aggregate throughput at saturation is measured. There is no time-to-first-
-token, no per-request latency, no tail percentile, and no single-request number
+Latency is measured at one offered load on one stream: rho=0.4 on the ragged
+stream at rect3072. There is no latency measurement at any other load, on the
+uniform stream, or at the other cache sizing, and no single-request number
 anywhere in this repository.
 
 ---

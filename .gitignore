@@ -56,3 +56,5 @@ service-account*.json
 # else under bench/results/ is scratch output and stays ignored.
 !bench/results/batch-order/
 !bench/results/batch-order/**
+!bench/results/arrival/
+!bench/results/arrival/**
