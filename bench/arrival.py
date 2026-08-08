@@ -88,6 +88,10 @@ class Arrival:
     prompt_len: int
     decode_len: int
     arrives_at: float
+    # Carried so Stage 2 can submit the frozen request unchanged. Stage 1 only
+    # needs the length; keeping the tokens here means both stages layer arrival
+    # times over exactly the same stream object rather than two copies of it.
+    prompt_token_ids: tuple = ()
 
 
 @dataclass
@@ -118,7 +122,8 @@ def poisson_arrivals(stream: Sequence, rate: float, seed: int) -> list[Arrival]:
     for item in stream:
         now += rng.expovariate(rate)
         out.append(Arrival(item.request_id, len(item.prompt_token_ids),
-                           item.max_new_tokens, now))
+                           item.max_new_tokens, now,
+                           tuple(item.prompt_token_ids)))
     return out
 
 

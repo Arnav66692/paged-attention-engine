@@ -310,7 +310,7 @@ class HuggingFaceGenerator:
         )
 
     @torch.inference_mode()
-    def generate_batch(self, batch: Sequence[Request]) -> dict[str, tuple[int, ...]]:
+    def generate_batch(self, batch: Sequence[Request], **generate_kwargs) -> dict[str, tuple[int, ...]]:
         longest_prompt = max(request.prompt_len for request in batch)
         steps = max(request.max_new_tokens for request in batch)
 
@@ -338,6 +338,10 @@ class HuggingFaceGenerator:
             use_cache=True,
             pad_token_id=self.pad_token_id,
             eos_token_id=None,
+            # Stage 2 injects a LogitsProcessor here to timestamp the first
+            # token. Nothing else passes anything, and the default call is
+            # unchanged, so every existing measurement stays comparable.
+            **generate_kwargs,
         )
 
         outputs: dict[str, tuple[int, ...]] = {}
