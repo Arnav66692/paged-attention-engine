@@ -135,7 +135,7 @@ is the regime the gating change is meant to protect and the one with no data.
 |---|---|
 | backends selected, both K/V forms | `kaggle/session5` gate 2, `kaggle/session3` |
 | FLASH/CUDNN reject every shape on sm_75 | `docs/AMPERE_RECHECK.md` item 2 |
-| 1.62x / 1.84x end to end, uniform mask-free batch | `bench/results/arms/arm{A,B}-control-rect{3072,1757}-C64.json`, baseline levels |
+| 1.62x / 1.84x end to end, uniform mask-free batch | `kaggle/session6a/arm{A,B}-control-rect3072-C64.json` and `kaggle/session6b/arm{A,B}-control-rect1757-C64.json`, baseline levels (the `bench/results/arms/` working copies are byte-identical but untracked) |
 | `use_gqa_in_sdpa` returns True iff mask is None | transformers 5.12.1 and `main`, verified 2026-08 |
 | repro output, 1.35x and 1.26x on two runs | `kaggle/session9/session9_report.json` and `session9_report_run2.json`, both standalone from a bare directory, rc=0 |
 | torch's own warning text | same run, verbatim from stderr |
