@@ -120,10 +120,12 @@ is the regime the gating change is meant to protect and the one with no data.
 > FLASH can honour `enable_gqa` there, both columns should name the same backend
 > and the delta should collapse; that is a prediction, not a measurement.
 >
-> No opinion on the fix itself. The `SDPAParams` / fullgraph blocker is real and
-> I have nothing to add on it, and the `+2.6%` probe overhead in the thread is a
-> different quantity from anything above, since it is the cost of the check on
-> hardware where the fallback never fires. The only thing I am adding is that on
+> No opinion on the fix itself. One thing that may have changed since this
+> thread went quiet: the `SDPAParams` / fullgraph blocker it references,
+> pytorch#182684, was closed as completed on 2026-07-25, so the torch-native
+> eligibility check may be viable again. The `+2.6%` probe overhead in the
+> thread is a different quantity from anything above, since it is the cost of
+> the check on hardware where the fallback never fires. The only thing I am adding is that on
 > sm < 80 the fallback is not an edge case but the default path for unpadded
 > batches, and that it is worth 1.6 to 1.8x there.
 
