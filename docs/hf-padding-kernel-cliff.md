@@ -95,3 +95,6 @@ never fires. There is no sm_75 data in the thread.
 
 Found while benchmarking a paged attention inference engine I wrote from
 scratch. That is [here](https://github.com/Arnav66692/paged-attention-engine).
+The engine loses on throughput when the whole workload is known in advance, and
+wins on latency when it is not, with its overhead measured at 1.6 to 2.2x per
+row-step. Both results are in its README, the loss first.

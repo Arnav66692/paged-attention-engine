@@ -7,6 +7,9 @@ out/
 # Kaggle staging and fetched outputs. Rebuilt by kaggle/push.py; never committed.
 kaggle/_build/
 kaggle/_output/
+# Published result files are FORCE-ADDED (git add -f) despite this ignore,
+# because negation patterns cannot re-include files under an ignored directory.
+# Tracked this way: bench/results/batch-order/ and bench/results/arrival/.
 bench/results/
 bench/plots/
 
@@ -56,5 +59,3 @@ service-account*.json
 # else under bench/results/ is scratch output and stays ignored.
 !bench/results/batch-order/
 !bench/results/batch-order/**
-!bench/results/arrival/
-!bench/results/arrival/**

@@ -4,9 +4,16 @@ The README carries the result. This carries the working: every table, every
 refuted hypothesis, and the confounds that had to be measured before any of it
 could be quoted.
 
+The summary, in one sentence: the engine loses on throughput when the whole
+workload is known in advance, and wins on latency when it is not, with its
+overhead measured at 1.6 to 2.2x per row-step. The tables below predate the
+sorted-baseline and arrival measurements; where this file says "headline" it
+means the ratio against the ARRIVAL-ORDER baseline, which the README has since
+superseded. Every number remains real and traceable.
+
 ---
 
-## The headline: `mixed`, both sides on `EFFICIENT_ATTENTION`
+## The arrival-order baseline: `mixed`, both sides on `EFFICIENT_ATTENTION`
 
 Engine tokens/s over baseline tokens/s. Median of 3 measured passes after 1
 discarded warmup; pass spread 0.05–0.25%, so these ratios are resolved to well
