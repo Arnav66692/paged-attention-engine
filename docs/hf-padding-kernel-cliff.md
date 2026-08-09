@@ -90,8 +90,8 @@ is a prediction and not something I measured.
 Not yet reported. The thread it belongs on is
 [huggingface/transformers#45776](https://github.com/huggingface/transformers/issues/45776),
 which already describes the mechanism and lists `sm < 80` among the constraints,
-but benchmarks on sm_86 and sm_89 hardware, where FLASH exists and the fallback
-never fires. There is no sm_75 data in the thread.
+but benchmarks on sm_86 and sm_89 hardware, where FLASH is available, so the
+fallback is not expected to fire. There is no sm_75 data in the thread.
 
 Found while benchmarking a paged attention inference engine I wrote from
 scratch. That is [here](https://github.com/Arnav66692/paged-attention-engine).
