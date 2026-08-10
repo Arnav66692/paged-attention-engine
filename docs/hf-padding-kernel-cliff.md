@@ -87,11 +87,13 @@ is a prediction and not something I measured.
 
 ## Where it goes
 
-Not yet reported. The thread it belongs on is
-[huggingface/transformers#45776](https://github.com/huggingface/transformers/issues/45776),
+Reported upstream on 2026-08-09:
+[the comment with the sm_75 measurements and repro](https://github.com/huggingface/transformers/pull/45776#issuecomment-5230620009)
+on [huggingface/transformers#45776](https://github.com/huggingface/transformers/issues/45776),
 which already describes the mechanism and lists `sm < 80` among the constraints,
 but benchmarks on sm_86 and sm_89 hardware, where FLASH is available, so the
-fallback is not expected to fire. There is no sm_75 data in the thread.
+fallback is not expected to fire. The thread had no sm_75 data before that
+comment.
 
 Found while benchmarking a paged attention inference engine I wrote from
 scratch. That is [here](https://github.com/Arnav66692/paged-attention-engine).

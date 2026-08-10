@@ -209,10 +209,10 @@ Standalone reproduction, torch + transformers only:
 [`docs/upstream/repro_enable_gqa_padding_cliff.py`](docs/upstream/repro_enable_gqa_padding_cliff.py).
 Its defaults are smaller than the table — batch 8, 64 new tokens — and it reports
 roughly **1.3×** (1.35 and 1.26 on two runs); the gap widens with decode length and batch. Written up on its own at
-[`docs/hf-padding-kernel-cliff.md`](docs/hf-padding-kernel-cliff.md). Not yet
-reported upstream; the thread it belongs on is
-[huggingface/transformers#45776](https://github.com/huggingface/transformers/issues/45776),
-which already describes the mechanism but has no sm_75 data.
+[`docs/hf-padding-kernel-cliff.md`](docs/hf-padding-kernel-cliff.md). Reported
+upstream on 2026-08-09 in
+[a comment on huggingface/transformers#45776](https://github.com/huggingface/transformers/pull/45776#issuecomment-5230620009),
+which thread already describes the mechanism but had no sm_75 data.
 
 ---
 

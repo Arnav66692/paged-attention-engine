@@ -10,7 +10,7 @@ committed result files on 2026-08-09.
 |---|---|
 | HN submission, X post 5, email [LINK] | docs/hf-padding-kernel-cliff.md (the finding page) |
 | X post 7 | the repo root |
-| upstream comment | huggingface/transformers#45776, attach docs/upstream/repro_enable_gqa_padding_cliff.py |
+| upstream comment | posted 2026-08-09: https://github.com/huggingface/transformers/pull/45776#issuecomment-5230620009 |
 
 ## Publication order
 
