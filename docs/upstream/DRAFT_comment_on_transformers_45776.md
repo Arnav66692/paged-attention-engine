@@ -1,6 +1,6 @@
 # DRAFT — comment for huggingface/transformers#45776
 
-**Status: NOT POSTED. Nav reviews and posts this, under his own name, or not.**
+**Status: POSTED 2026-08-09 as <https://github.com/huggingface/transformers/pull/45776#issuecomment-5230620009>.**
 
 - Target: <https://github.com/huggingface/transformers/issues/45776> —
   *"Gate `enable_gqa=True` on actual flash-attention eligibility"* (open, draft PR)
