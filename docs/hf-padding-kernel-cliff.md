@@ -100,3 +100,11 @@ scratch. That is [here](https://github.com/Arnav66692/paged-attention-engine).
 The engine loses on throughput when the whole workload is known in advance, and
 wins on latency when it is not, with its overhead measured at 1.6 to 2.2x per
 row-step. Both results are in its README, the loss first.
+
+## Resume line
+
+Found, measured, and reported upstream a HuggingFace transformers performance
+cliff (transformers#45776) where equal-length prompt batches select a slower
+attention kernel on pre-Ampere GPUs: on a Tesla T4, as-shipped generate ran at
+177.8 tok/s against 288.9 tok/s with K/V pre-expanded, a 1.62x speedup from
+flipping one boolean.
