@@ -41,7 +41,7 @@ Author here. I hit this while benchmarking a paged attention engine against Hugg
 
 The short version: use_gqa_in_sdpa() gates on attention_mask is None, which for generate() means "nothing was left padded", which means "all prompts the same length". It then passes unexpanded K/V with enable_gqa=True, and on sm < 80 no backend can honour that, so torch falls back to MATH.
 
-The upstream thread at #45776 already had the mechanism and even lists sm < 80 among the constraints, but it benchmarks on sm_86 and sm_89 hardware, where FLASH is available, so the fallback is not expected to fire. There was no sm_75 data. I only have a T4, so I do not know what this does on Ampere.
+The upstream thread at #45776 already had the mechanism and even lists sm < 80 among the constraints, but it benchmarks on sm_86 and sm_89 hardware, where FLASH is available, so the fallback is not expected to fire. The thread had no sm_75 data until 2026-08-09, when I posted the T4 measurements and standalone repro there: https://github.com/huggingface/transformers/pull/45776#issuecomment-5230620009. I only have a T4, so I do not know what this does on Ampere.
 
 The engine itself is linked at the bottom of the page: it loses on throughput when the whole workload is known in advance, running at 0.67 to 0.73x a decode-sorted static batcher, and wins on latency when it is not, with its overhead measured at 1.6 to 2.2x per row-step.
 
