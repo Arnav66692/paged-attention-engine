@@ -5,10 +5,24 @@ recompute, and a fused batched forward. Written to find out what an inference
 engine is actually made of, and benchmarked against naive HuggingFace
 `generate` at an identical KV byte ceiling.
 
+[![CPU correctness](https://github.com/Arnav66692/paged-attention-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/Arnav66692/paged-attention-engine/actions/workflows/ci.yml)
+
+Start with [results](#the-result-the-engine-loses-to-a-static-batcher-that-sorts-its-input),
+[full findings](docs/FINDINGS.md), or the CPU checks:
+
 ```bash
-pip install -r requirements-dev.txt
-pytest                    # ~12 min. `pytest -m slow` is a second ~3.
+python3.14 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements-dev.txt
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m pytest
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m pytest -m slow
 ```
+
+Model parity tests download Qwen weights from Hugging Face and need several GB
+of free RAM. Run the default and slow selections **serially**. CI isolates model
+modules in separate jobs and includes slow tests; CUDA-only checks skip on CPU.
+A green CPU badge does not validate GPU kernels or reproduce T4 performance.
+The example below requires CUDA; the correctness suite supports CPU.
 
 ```python
 from transformers import AutoModelForCausalLM
@@ -46,6 +60,10 @@ batching — reverses it:
 | **ragged**, rect3072, C=64 | **1.91×** | **0.73×** — a loss |
 | **ragged**, rect1757, C=64 | **1.89×** | **0.67×** — a loss |
 | **uniform** — every prompt 512 + 512 | **0.66× – 0.79×** — a loss | not measured |
+
+![Throughput ratios against arrival-order and sorted baselines](docs/images/batch-order.png)
+
+Redraw from frozen JSON with `python scripts/plot_headline.py`; no GPU is needed.
 
 Both columns of a row were measured in one Kaggle session on one T4, with the
 engine rerun alongside each baseline; the engine landed within 0.03% of itself
@@ -156,9 +174,10 @@ the device, and no sensitivity analysis of it exists.
 
 The request stream is synthetic: lognormal prompt and decode lengths with no
 trace behind the parameters, uniformly random token IDs so no two requests share
-a prefix, all requests present at t=0, and one seed. Sensitivity to the
-dispersion, to prefix sharing, to an arrival process, and to the seed is
-unmeasured.
+a prefix. The saturated throughput experiment puts all requests at t=0 and
+uses one seed. Dispersion, prefix-sharing and seed sensitivity are unmeasured.
+The separate arrival-process experiment above measures latency at one load;
+it is not a sweep of those sensitivities.
 
 Most of the ragged-stream margin against the arrival-order baseline is one
 attention-kernel choice: switching the engine's GQA path from `sdpa` to
